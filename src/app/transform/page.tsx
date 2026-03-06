@@ -1,13 +1,14 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { FileUploader } from "@/components/tools/FileUploader";
 import { DataTable } from "@/components/tools/DataTable";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { useActiveModel } from "@/lib/hooks";
-import { Download, Loader2, AlertCircle, CheckCircle2, ExternalLink } from "lucide-react";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
+import { Download, Loader2, AlertCircle, CheckCircle2, ExternalLink, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import pLimit from "p-limit";
 import Link from "next/link";
@@ -44,14 +45,34 @@ export default function TransformPage() {
   const [results, setResults] = useState<Row[]>([]);
   const [stats, setStats] = useState<{ success: number; errors: number; avgLatency: number } | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
-  const [concurrency, setConcurrency] = useState(5);
   const [isMounted, setIsMounted] = useState(false);
+
+  const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
+  const [filterCol, setFilterCol] = useState("");
+  const [filterOp, setFilterOp] = useState<"contains" | "equals" | "gt" | "lt">("contains");
+  const [filterVal, setFilterVal] = useState("");
 
   const abortRef = useRef(false);
   const startedAtRef = useRef<number>(0);
 
   const activeModel = useActiveModel();
+  const systemSettings = useSystemSettings();
   const allColumns = data.length > 0 ? Object.keys(data[0]) : [];
+
+  const filteredIndices = useMemo(() => {
+    if (!filterCol || !filterVal) return data.map((_, i) => i);
+    return data.reduce<number[]>((acc, row, i) => {
+      const val = String(row[filterCol] ?? "").toLowerCase();
+      const fv = filterVal.toLowerCase();
+      const match = filterOp === "contains" ? val.includes(fv)
+        : filterOp === "equals" ? val === fv
+        : filterOp === "gt" ? Number(row[filterCol]) > Number(filterVal)
+        : filterOp === "lt" ? Number(row[filterCol]) < Number(filterVal)
+        : true;
+      if (match) acc.push(i);
+      return acc;
+    }, []);
+  }, [data, filterCol, filterOp, filterVal]);
 
   useEffect(() => {
     const saved = localStorage.getItem(PROMPT_KEY);
@@ -68,6 +89,7 @@ export default function TransformPage() {
     setData(newData);
     setDataName(name);
     setSelectedCols(Object.keys(newData[0] || {}));
+    setSelectedRows(new Set(newData.map((_, i) => i)));
     setResults([]);
     setStats(null);
     toast.success(`Loaded ${newData.length} rows from ${name}`);
@@ -92,10 +114,11 @@ export default function TransformPage() {
     if (!activeModel) return toast.error("No model configured. Go to Settings.");
     if (selectedCols.length === 0) return toast.error("Select at least one column");
 
+    const selectedData = data.filter((_, i) => selectedRows.has(i));
     const targetData =
-      mode === "preview" ? data.slice(0, 3) :
-      mode === "test"    ? data.slice(0, 10) :
-      data;
+      mode === "preview" ? selectedData.slice(0, 3) :
+      mode === "test"    ? selectedData.slice(0, 10) :
+      selectedData;
 
     abortRef.current = false;
     startedAtRef.current = Date.now();
@@ -106,7 +129,7 @@ export default function TransformPage() {
     setResults([]);
     setStats(null);
 
-    const limit = pLimit(concurrency);
+    const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [...targetData];
     const latencies: number[] = [];
 
@@ -117,7 +140,7 @@ export default function TransformPage() {
           runType: "transform",
           provider: activeModel.providerId,
           model: activeModel.defaultModel,
-          temperature: 0,
+          temperature: systemSettings.temperature,
           systemPrompt,
           inputFile: dataName || "unnamed",
           inputRows: targetData.length,
@@ -131,16 +154,19 @@ export default function TransformPage() {
             runType: "transform",
             provider: activeModel.providerId,
             model: activeModel.defaultModel,
-            temperature: 0,
+            temperature: systemSettings.temperature,
             systemPrompt,
             inputFile: dataName || "unnamed",
             inputRows: targetData.length,
           }),
         });
+        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
         const rd = await runRes.json();
         localRunId = rd.id ?? null;
       }
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
 
     const tasks = targetData.map((row, idx) =>
       limit(async () => {
@@ -158,7 +184,7 @@ export default function TransformPage() {
               baseUrl: activeModel.baseUrl,
               systemPrompt,
               userContent: Object.entries(subset).map(([k, v]) => `${k}: ${String(v ?? "")}`).join("\n"),
-              temperature: 0,
+              temperature: systemSettings.temperature,
             });
           } else {
             const res = await fetch("/api/process-row", {
@@ -171,9 +197,10 @@ export default function TransformPage() {
                 baseUrl: activeModel.baseUrl,
                 systemPrompt,
                 userContent: Object.entries(subset).map(([k, v]) => `${k}: ${String(v ?? "")}`).join("\n"),
-                temperature: 0,
+                temperature: systemSettings.temperature,
               }),
             });
+            if (!res.ok) throw new Error(`Server error ${res.status}`);
             const json = await res.json();
             if (json.error) throw new Error(json.error);
             result = { output: json.output, latency: (Date.now() - t0) / 1000 };
@@ -210,7 +237,9 @@ export default function TransformPage() {
             body: JSON.stringify({ runId: localRunId, results: resultRows }),
           });
         }
-      } catch { /* non-fatal */ }
+      } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
     }
 
     setRunId(localRunId);
@@ -308,6 +337,48 @@ export default function TransformPage() {
         )}
       </div>
 
+      {/* ── 2b. Filter & Select Rows ──────────────────────────────────────── */}
+      {data.length > 0 && (
+        <div className="space-y-4 py-8">
+          <div className="border-t mb-4" />
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold">Filter & Select Rows</h3>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>{selectedRows.size} of {data.length} rows selected</span>
+              <button onClick={() => setSelectedRows(new Set(filteredIndices))} className="underline hover:text-foreground">Select filtered</button>
+              <button onClick={() => setSelectedRows(new Set(data.map((_, i) => i)))} className="underline hover:text-foreground">All</button>
+              <button onClick={() => setSelectedRows(new Set())} className="underline hover:text-foreground">None</button>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Select value={filterCol} onValueChange={setFilterCol}>
+              <SelectTrigger className="h-8 text-xs w-[160px]"><SelectValue placeholder="Column..." /></SelectTrigger>
+              <SelectContent>
+                {allColumns.map((c) => <SelectItem key={c} value={c} className="text-xs">{c}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={filterOp} onValueChange={(v) => setFilterOp(v as typeof filterOp)}>
+              <SelectTrigger className="h-8 text-xs w-[120px]"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="contains" className="text-xs">contains</SelectItem>
+                <SelectItem value="equals" className="text-xs">equals</SelectItem>
+                <SelectItem value="gt" className="text-xs">greater than</SelectItem>
+                <SelectItem value="lt" className="text-xs">less than</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input value={filterVal} onChange={(e) => setFilterVal(e.target.value)} placeholder="Value..." className="h-8 text-xs w-[160px]" />
+            <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setSelectedRows(new Set(filteredIndices))}>
+              Apply Filter
+            </Button>
+            {filterVal && (
+              <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={() => { setFilterCol(""); setFilterVal(""); setSelectedRows(new Set(data.map((_, i) => i))); }}>
+                Clear
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="border-t" />
 
       {/* ── 3. Processing Instructions ────────────────────────────────────── */}
@@ -321,7 +392,7 @@ export default function TransformPage() {
               <span className="text-xs text-muted-foreground">Example:</span>
               <Select onValueChange={(v) => { if (v) setSystemPrompt(EXAMPLE_PROMPTS[v] || ""); }}>
                 <SelectTrigger className="h-7 text-xs w-[200px]">
-                  <SelectValue placeholder="Load an example…" />
+                  <SelectValue placeholder="Load an example..." />
                 </SelectTrigger>
                 <SelectContent>
                   {Object.keys(EXAMPLE_PROMPTS).map((k) => (
@@ -364,7 +435,7 @@ export default function TransformPage() {
             <div className="flex justify-between text-xs text-muted-foreground">
               <span className="flex items-center gap-1.5">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {runMode !== "full" ? (runMode === "preview" ? "Preview" : "Test") + " run" : "Full run"} — processing {progress.total} rows…
+                {runMode !== "full" ? (runMode === "preview" ? "Preview" : "Test") + " run" : "Full run"} — processing {progress.total} rows...
                 {etaStr && <span className="text-muted-foreground ml-1">{etaStr}</span>}
               </span>
               <div className="flex items-center gap-2">
@@ -381,32 +452,24 @@ export default function TransformPage() {
           </div>
         )}
 
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <span>Concurrency:</span>
-          <button className="px-2 py-1 border rounded hover:bg-muted transition-colors" onClick={() => setConcurrency(c => Math.max(1, c - 1))}>−</button>
-          <span className="px-3 border-x min-w-[2rem] text-center">{concurrency}</span>
-          <button className="px-2 py-1 border rounded hover:bg-muted transition-colors" onClick={() => setConcurrency(c => Math.min(10, c + 1))}>+</button>
-          <span className="text-xs">(parallel API calls)</span>
-        </div>
-
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Button variant="outline" size="lg" className="h-12 text-sm border-dashed"
-            disabled={data.length === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
+            disabled={data.length === 0 || selectedRows.size === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
             onClick={() => runTransformation("preview")}>
             {isProcessing && runMode === "preview" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
             Preview (3 rows)
           </Button>
           <Button size="lg" className="h-12 text-base bg-red-500 hover:bg-red-600 text-white"
-            disabled={data.length === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
+            disabled={data.length === 0 || selectedRows.size === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
             onClick={() => runTransformation("test")}>
             {isProcessing && runMode === "test" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
             Test (10 rows)
           </Button>
           <Button variant="outline" size="lg" className="h-12 text-base"
-            disabled={data.length === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
+            disabled={data.length === 0 || selectedRows.size === 0 || isProcessing || !activeModel || !systemPrompt.trim() || selectedCols.length === 0}
             onClick={() => runTransformation("full")}>
             {isProcessing && runMode === "full" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-            Full Run ({data.length} rows)
+            Full Run ({selectedRows.size} rows)
           </Button>
         </div>
       </div>
@@ -426,6 +489,17 @@ export default function TransformPage() {
                   View in History
                 </Link>
               )}
+              <Button variant="outline" size="sm" onClick={() => {
+                setData(results);
+                setDataName(`re-transformed_${dataName}`);
+                setSelectedCols(Object.keys(results[0] || {}));
+                setSelectedRows(new Set(results.map((_, i) => i)));
+                setResults([]);
+                setStats(null);
+                toast.success("Results loaded as new input data — edit prompt and run again");
+              }}>
+                <RefreshCw className="h-4 w-4 mr-2" /> Re-transform
+              </Button>
               <Button variant="outline" size="sm" onClick={handleExport}>
                 <Download className="h-4 w-4 mr-2" /> Export CSV
               </Button>
@@ -438,9 +512,9 @@ export default function TransformPage() {
                 {stats.errors > 0 ? <AlertCircle className="h-4 w-4 text-amber-500" /> : <CheckCircle2 className="h-4 w-4 text-green-500" />}
                 <span className="font-medium">{stats.errors > 0 ? `Completed with ${stats.errors} error${stats.errors > 1 ? "s" : ""}` : "All rows transformed successfully"}</span>
               </div>
-              <span className="text-muted-foreground text-xs">✓ {stats.success}</span>
-              {stats.errors > 0 && <span className="text-red-500 text-xs">✗ {stats.errors}</span>}
-              <span className="text-muted-foreground text-xs">⏱ avg {stats.avgLatency}ms</span>
+              <span className="text-muted-foreground text-xs">{"\u2713"} {stats.success}</span>
+              {stats.errors > 0 && <span className="text-red-500 text-xs">{"\u2717"} {stats.errors}</span>}
+              <span className="text-muted-foreground text-xs">{"\u23F1"} avg {stats.avgLatency}ms</span>
               {runMode !== "full" && <span className="ml-auto text-xs font-medium text-blue-600 border border-blue-200 px-2 py-0.5 rounded bg-blue-50">{runMode === "preview" ? "Preview" : "Test"} run · {results.length}/{data.length} rows</span>}
             </div>
           )}

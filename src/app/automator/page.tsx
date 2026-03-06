@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
-import { useActiveModel } from "@/lib/hooks";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
 import {
   Plus,
   X,
@@ -73,6 +73,7 @@ export default function AutomatorPage() {
   const [runId, setRunId] = useState<string | null>(null);
 
   const provider = useActiveModel();
+  const systemSettings = useSystemSettings();
 
   useEffect(() => {
     try {
@@ -175,7 +176,7 @@ export default function AutomatorPage() {
     setRunMode(mode);
     setProgress({ completed: 0, total: targetData.length });
 
-    const limit = pLimit(2);
+    const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [];
 
     let localRunId: string | null = null;
@@ -185,7 +186,7 @@ export default function AutomatorPage() {
           runType: "automator",
           provider: provider.providerId,
           model: provider.defaultModel,
-          temperature: 0,
+          temperature: systemSettings.temperature,
           systemPrompt: JSON.stringify(steps),
           inputFile: dataName || "unnamed_data",
           inputRows: targetData.length,
@@ -199,16 +200,19 @@ export default function AutomatorPage() {
             runType: "automator",
             provider: provider.providerId,
             model: provider.defaultModel,
-            temperature: 0,
+            temperature: systemSettings.temperature,
             systemPrompt: JSON.stringify(steps),
             inputFile: dataName || "unnamed_data",
             inputRows: targetData.length,
           }),
         });
+        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
         const rd = await runRes.json();
         localRunId = rd.id ?? null;
       }
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
 
     const tasks = targetData.map((row, idx) =>
       limit(async () => {
@@ -238,12 +242,28 @@ export default function AutomatorPage() {
                 baseUrl: provider.baseUrl,
               }),
             });
+            if (!res.ok) throw new Error(`Server error ${res.status}`);
             const json = await res.json();
             if (json.error) throw new Error(json.error);
             result = json;
           }
 
-          newResults[idx] = { ...result.output, status: "success", latency: Date.now() - t0 };
+          // Check if result.output is essentially the same as input (extraction failed silently)
+          const outputKeys = Object.keys(result.output || {});
+          const inputKeys = Object.keys(row);
+          const newKeys = outputKeys.filter(k => !inputKeys.includes(k) && k !== 'status' && k !== 'latency');
+          if (newKeys.length === 0 && steps.length > 0) {
+            // No new fields added — extraction likely failed
+            newResults[idx] = {
+              ...row,
+              ...result.output,
+              _step_warning: "No new fields extracted — check step configuration",
+              status: "warning",
+              latency: Date.now() - t0,
+            };
+          } else {
+            newResults[idx] = { ...result.output, status: "success", latency: Date.now() - t0 };
+          }
         } catch (err) {
           console.error(err);
           newResults[idx] = { ...row, automator_error: true, status: "error", errorMessage: String(err), latency: Date.now() - t0 };
@@ -268,13 +288,16 @@ export default function AutomatorPage() {
         if (isTauri) {
           await saveResults(localRunId, resultRows);
         } else {
-          await fetch("/api/results", {
+          const saveRes = await fetch("/api/results", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ runId: localRunId, results: resultRows }),
           });
+          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
         }
-      } catch { /* non-fatal */ }
+      } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
     }
 
     setRunId(localRunId);
@@ -541,6 +564,17 @@ export default function AutomatorPage() {
             </div>
             <DataTable data={results} />
           </div>
+          {(() => {
+            const warnings = results.filter(r => r.status === "warning").length;
+            const errors = results.filter(r => r.status === "error").length;
+            if (warnings === 0 && errors === 0) return null;
+            return (
+              <div className="flex items-center gap-4 px-4 py-2.5 rounded-lg border bg-amber-50 dark:bg-amber-950/20 border-amber-200 text-sm">
+                {errors > 0 && <span className="text-red-600">{errors} errors</span>}
+                {warnings > 0 && <span className="text-amber-600">{warnings} rows with extraction warnings</span>}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>

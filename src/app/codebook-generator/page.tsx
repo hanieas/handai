@@ -7,12 +7,16 @@ import { SampleDatasetPicker } from "@/components/tools/SampleDatasetPicker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
-import { useActiveModel } from "@/lib/hooks";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
 import { getPrompt } from "@/lib/prompts";
 import { Download, Loader2, CheckCircle2, AlertCircle, Copy, X } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
 import type { Row } from "@/types";
+import { processRowDirect } from "@/lib/llm-browser";
+import { createRun, saveResults } from "@/lib/db-tauri";
+
+const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 type Stage = "idle" | "discovery" | "consolidation" | "definition" | "done";
 
@@ -67,6 +71,7 @@ export default function CodebookGeneratorPage() {
   const [phaseAQuickMode, setPhaseAQuickMode] = useState(false);
 
   const providerConfig = useActiveModel();
+  const systemSettings = useSystemSettings();
 
   const handleDataLoaded = (loaded: Row[], name: string) => {
     setData(loaded);
@@ -87,20 +92,34 @@ export default function CodebookGeneratorPage() {
 
   const callLLM = async (systemPrompt: string, userContent: string): Promise<string> => {
     if (!providerConfig) throw new Error("No enabled provider with API key found");
-    const res = await fetch("/api/process-row", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    let result: { output?: string; error?: string };
+    if (isTauri) {
+      result = await processRowDirect({
         provider: providerConfig.providerId,
         model: providerConfig.defaultModel,
-        apiKey: providerConfig.apiKey || "local",
+        apiKey: providerConfig.apiKey || "",
         baseUrl: providerConfig.baseUrl,
         systemPrompt,
         userContent,
-        temperature: 0.3,
-      }),
-    });
-    const result = await res.json();
+        temperature: systemSettings.temperature || 0.3,
+      });
+    } else {
+      const res = await fetch("/api/process-row", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: providerConfig.providerId,
+          model: providerConfig.defaultModel,
+          apiKey: providerConfig.apiKey || "local",
+          baseUrl: providerConfig.baseUrl,
+          systemPrompt,
+          userContent,
+          temperature: systemSettings.temperature || 0.3,
+        }),
+      });
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      result = await res.json();
+    }
     if (result.error) throw new Error(result.error);
     return result.output as string;
   };
@@ -175,6 +194,35 @@ export default function CodebookGeneratorPage() {
       setCodebook(mdText);
       setStage("done");
       toast.success("Codebook generated (3 stages complete)!");
+
+      // Save to history DB
+      try {
+        const runParams = { runType: "codebook-generator", provider: providerConfig.providerId, model: providerConfig.defaultModel, temperature: systemSettings.temperature || 0.3, systemPrompt: "3-stage codebook pipeline", inputFile: dataName || "unnamed", inputRows: data.length };
+        let runId: string | null = null;
+        if (isTauri) {
+          const rd = await createRun(runParams);
+          runId = rd.id ?? null;
+        } else {
+          const res = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(runParams) });
+          if (!res.ok) throw new Error(`Server error ${res.status}`);
+          const rd = await res.json();
+          runId = rd.id ?? null;
+        }
+        if (runId) {
+          const resultRows = (structured.length > 0 ? structured : [{ raw: mdText }]).map((entry, i) => ({
+            rowIndex: i,
+            input: { stage: "codebook" } as Record<string, unknown>,
+            output: JSON.stringify(entry),
+            status: "success" as const,
+            latency: 0,
+          }));
+          if (isTauri) {
+            await saveResults(runId, resultRows);
+          } else {
+            await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, results: resultRows }) });
+          }
+        }
+      } catch (err) { console.warn("Failed to save codebook to history:", err); }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error("Codebook generation failed", { description: msg });

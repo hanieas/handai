@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
 import { useAppStore } from "@/lib/store";
+import { useSystemSettings } from "@/lib/hooks";
 import { downloadCSV } from "@/lib/export";
 import { Download, Loader2, CheckCircle2, ChevronDown, ChevronRight, HelpCircle, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
@@ -19,7 +20,7 @@ import pLimit from "p-limit";
 import Link from "next/link";
 import type { Row } from "@/types";
 import { consensusRowDirect } from "@/lib/llm-browser";
-import { createRun } from "@/lib/db-tauri";
+import { createRun, saveResults } from "@/lib/db-tauri";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -59,12 +60,52 @@ function providerLabel(id: string) {
   return id.charAt(0).toUpperCase() + id.slice(1);
 }
 
+function WorkerCard({ label, cfg, setCfg, enabledProviders }: {
+  label: string;
+  cfg: WorkerConfig;
+  setCfg: (c: WorkerConfig) => void;
+  enabledProviders: { providerId: string; defaultModel: string; isEnabled: boolean; apiKey?: string; baseUrl?: string; isLocal?: boolean }[];
+}) {
+  return (
+    <div className="space-y-3">
+      <div className="text-base font-bold">{label}</div>
+      <div className="space-y-1.5">
+        <Label className="text-xs text-muted-foreground">Provider</Label>
+        <Select value={cfg.providerId} onValueChange={(v) => setCfg({ ...cfg, providerId: v })}>
+          <SelectTrigger className="text-sm">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {enabledProviders.map((p) => (
+              <SelectItem key={p.providerId} value={p.providerId} className="text-sm">
+                {providerLabel(p.providerId)}
+              </SelectItem>
+            ))}
+            {enabledProviders.length === 0 && (
+              <SelectItem value={cfg.providerId} className="text-sm">No providers configured</SelectItem>
+            )}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-1.5">
+        <Label className="text-xs text-muted-foreground">Model</Label>
+        <Input
+          value={cfg.model}
+          onChange={(e) => setCfg({ ...cfg, model: e.target.value })}
+          placeholder="Model ID (e.g. gpt-4o)"
+          className="text-sm font-mono"
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function ConsensusCoderPage() {
   const [data, setData] = useState<Row[]>([]);
   const [dataName, setDataName] = useState("");
   const [selectedCols, setSelectedCols] = useState<string[]>([]);
-  const [workerPrompt, setWorkerPrompt] = useState(DEFAULT_WORKER_PROMPT);
-  const [judgePrompt, setJudgePrompt] = useState(DEFAULT_JUDGE_PROMPT);
+  const [workerPrompt, setWorkerPrompt] = useState("");
+  const [judgePrompt, setJudgePrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [runMode, setRunMode] = useState<RunMode>("full");
   const [runId, setRunId] = useState<string | null>(null);
@@ -81,6 +122,7 @@ export default function ConsensusCoderPage() {
   const [enableDisagreementAnalysis, setEnableDisagreementAnalysis] = useState(false);
 
   const providers = useAppStore((state) => state.providers);
+  const systemSettings = useSystemSettings();
   const enabledProviders = Object.values(providers).filter((p) => p.isEnabled);
   const firstId = enabledProviders[0]?.providerId ?? "openai";
   const firstModel = enabledProviders[0]?.defaultModel ?? "gpt-4o";
@@ -151,20 +193,23 @@ export default function ConsensusCoderPage() {
     let localRunId: string | null = null;
     try {
       if (isTauri) {
-        const rd = await createRun({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: 0, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length });
+        const rd = await createRun({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: systemSettings.temperature, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length });
         localRunId = rd.id;
       } else {
         const runRes = await fetch("/api/runs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: 0, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length }),
+          body: JSON.stringify({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: systemSettings.temperature, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length }),
         });
+        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
         const rd = await runRes.json();
         localRunId = rd.id ?? null;
       }
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      console.warn("Run creation failed:", err);
+    }
 
-    const limit = pLimit(3);
+    const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [...targetData];
     let runningKappa: number | null = null;
     let runningKappaLabel = "";
@@ -209,6 +254,7 @@ export default function ConsensusCoderPage() {
                 enableDisagreementAnalysis,
               }),
             });
+            if (!res.ok) throw new Error(`Server error ${res.status}`);
             const data = await res.json();
             if (data.error) throw new Error(data.error);
             result = data;
@@ -259,6 +305,32 @@ export default function ConsensusCoderPage() {
 
     await Promise.all(tasks);
     setResults(newResults);
+
+    // Save results to history
+    if (localRunId) {
+      try {
+        const resultRows = newResults.map((r, i) => ({
+          rowIndex: i,
+          input: r as Record<string, unknown>,
+          output: (r.judge_best_answer ?? "") as string,
+          status: (r.consensus === "Error" ? "error" : "success") as string,
+          errorMessage: r.error_msg as string | undefined,
+        }));
+        if (isTauri) {
+          await saveResults(localRunId, resultRows);
+        } else {
+          const saveRes = await fetch("/api/results", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ runId: localRunId, results: resultRows }),
+          });
+          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
+        }
+      } catch (err) {
+        console.warn("Failed to save results to history:", err);
+      }
+    }
+
     setRunId(localRunId);
     if (runningKappa !== null) {
       setKappaStats({ kappa: runningKappa, kappaLabel: runningKappaLabel });
@@ -277,39 +349,6 @@ export default function ConsensusCoderPage() {
   };
 
   const progressPct = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
-
-  const WorkerCard = ({ label, cfg, setCfg }: { label: string; cfg: WorkerConfig; setCfg: (c: WorkerConfig) => void }) => (
-    <div className="space-y-3">
-      <div className="text-base font-bold">{label}</div>
-      <div className="space-y-1.5">
-        <Label className="text-xs text-muted-foreground">Provider</Label>
-        <Select value={cfg.providerId} onValueChange={(v) => setCfg({ ...cfg, providerId: v })}>
-          <SelectTrigger className="text-sm">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {enabledProviders.map((p) => (
-              <SelectItem key={p.providerId} value={p.providerId} className="text-sm">
-                {providerLabel(p.providerId)}
-              </SelectItem>
-            ))}
-            {enabledProviders.length === 0 && (
-              <SelectItem value={cfg.providerId} className="text-sm">No providers configured</SelectItem>
-            )}
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="space-y-1.5">
-        <Label className="text-xs text-muted-foreground">Model</Label>
-        <Input
-          value={cfg.model}
-          onChange={(e) => setCfg({ ...cfg, model: e.target.value })}
-          placeholder="Model ID (e.g. gpt-4o)"
-          className="text-sm font-mono"
-        />
-      </div>
-    </div>
-  );
 
   return (
     <div className="max-w-4xl mx-auto space-y-0 pb-16">
@@ -385,14 +424,14 @@ export default function ConsensusCoderPage() {
 
         <div className="border rounded-lg p-5 space-y-5">
           <div className="grid grid-cols-2 gap-8">
-            <WorkerCard label="Worker 1" cfg={worker1} setCfg={setWorker1} />
-            <WorkerCard label="Worker 2" cfg={worker2} setCfg={setWorker2} />
+            <WorkerCard label="Worker 1" cfg={worker1} setCfg={setWorker1} enabledProviders={enabledProviders} />
+            <WorkerCard label="Worker 2" cfg={worker2} setCfg={setWorker2} enabledProviders={enabledProviders} />
           </div>
 
           {worker3Enabled && (
             <div className="border-t pt-5">
               <div className="grid grid-cols-2 gap-8">
-                <WorkerCard label="Worker 3" cfg={worker3} setCfg={setWorker3} />
+                <WorkerCard label="Worker 3" cfg={worker3} setCfg={setWorker3} enabledProviders={enabledProviders} />
                 <div />
               </div>
             </div>
@@ -450,7 +489,27 @@ export default function ConsensusCoderPage() {
 
       {/* ── 4. Prompts ────────────────────────────────────────────────────── */}
       <div className="space-y-5 py-8">
-        <h2 className="text-2xl font-bold">4. Prompts</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-2xl font-bold">4. Prompts</h2>
+          <Select onValueChange={(v) => {
+            if (v === "default") {
+              setWorkerPrompt(DEFAULT_WORKER_PROMPT);
+              setJudgePrompt(DEFAULT_JUDGE_PROMPT);
+            } else if (v === "rigorous") {
+              setWorkerPrompt("Analyze the provided data with extreme rigor. Double-check your reasoning.\n\nCRITICAL FORMAT REQUIREMENTS:\n- Output MUST be in strict CSV format\n- NO explanations, NO prose, NO markdown, NO code blocks\n- NO headers or labels - just the raw values\n\nRespond with ONLY the CSV-formatted data values. Nothing else.");
+              setJudgePrompt("You are a meticulous judge. Scrutinize each worker response for accuracy and completeness.\n\nCRITICAL: Your best_answer MUST be in strict CSV/tabular format:\n- Comma-separated values ONLY\n- NO explanations, NO prose, NO markdown\n\nIf workers disagree, provide detailed reasoning for your choice.");
+            }
+            toast.success("Prompts loaded");
+          }}>
+            <SelectTrigger className="h-8 text-xs w-[180px]">
+              <SelectValue placeholder="Sample prompts…" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default" className="text-xs">Default (standard)</SelectItem>
+              <SelectItem value="rigorous" className="text-xs">Rigorous (detailed)</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
 
         <div className="grid grid-cols-2 gap-6">
           <div className="space-y-2">

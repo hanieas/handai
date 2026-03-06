@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import {
     Table,
     TableBody,
@@ -18,11 +18,52 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Search, ChevronLeft, ChevronRight } from "lucide-react";
+import { Search, ChevronLeft, ChevronRight, Download, ChevronDown } from "lucide-react";
 
 interface DataTableProps {
     data: any[];
     maxRows?: number;
+}
+
+type ExportFormat = "csv" | "tsv" | "json";
+
+function exportData(data: any[], format: ExportFormat, filename?: string) {
+    const headers = Object.keys(data[0] || {});
+    let content: string;
+    let mimeType: string;
+    let ext: string;
+
+    if (format === "csv") {
+        content = [
+            headers.join(","),
+            ...data.map((r) =>
+                headers.map((h) => `"${String(r[h] ?? "").replace(/"/g, '""')}"`).join(",")
+            ),
+        ].join("\n");
+        mimeType = "text/csv;charset=utf-8;";
+        ext = "csv";
+    } else if (format === "tsv") {
+        content = [
+            headers.join("\t"),
+            ...data.map((r) =>
+                headers.map((h) => String(r[h] ?? "").replace(/\t/g, " ")).join("\t")
+            ),
+        ].join("\n");
+        mimeType = "text/tab-separated-values;charset=utf-8;";
+        ext = "tsv";
+    } else {
+        content = JSON.stringify(data, null, 2);
+        mimeType = "application/json;charset=utf-8;";
+        ext = "json";
+    }
+
+    const blob = new Blob(["\uFEFF" + content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${filename || "data"}.${ext}`;
+    a.click();
+    URL.revokeObjectURL(url);
 }
 
 export function DataTable({ data, maxRows = 100 }: DataTableProps) {
@@ -30,7 +71,9 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
     const [sortCol, setSortCol] = useState<string | null>(null);
     const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
     const [searchQuery, setSearchQuery] = useState("");
+    const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
     const [tablePage, setTablePage] = useState(0);
+    const [showExportMenu, setShowExportMenu] = useState(false);
 
     useEffect(() => {
         setTablePage(0);
@@ -40,14 +83,31 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
 
     const headers = Object.keys(data[0]);
 
-    // Filter
-    const filteredData = searchQuery
-        ? data.filter((row) =>
-            headers.some((h) =>
-                String(row[h] ?? "").toLowerCase().includes(searchQuery.toLowerCase())
-            )
-          )
-        : data;
+    // Column filters
+    const hasColumnFilters = Object.values(columnFilters).some((v) => v.length > 0);
+
+    // Filter: global search + per-column
+    const filteredData = useMemo(() => {
+        let result = data;
+        if (searchQuery) {
+            const q = searchQuery.toLowerCase();
+            result = result.filter((row) =>
+                headers.some((h) =>
+                    String(row[h] ?? "").toLowerCase().includes(q)
+                )
+            );
+        }
+        if (hasColumnFilters) {
+            result = result.filter((row) =>
+                headers.every((h) => {
+                    const filter = columnFilters[h];
+                    if (!filter) return true;
+                    return String(row[h] ?? "").toLowerCase().includes(filter.toLowerCase());
+                })
+            );
+        }
+        return result;
+    }, [data, searchQuery, columnFilters, hasColumnFilters, headers]);
 
     // Sort
     const sortedData = sortCol
@@ -74,11 +134,18 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
         }
     };
 
+    const updateColumnFilter = (header: string, value: string) => {
+        setColumnFilters((prev) => ({ ...prev, [header]: value }));
+        setTablePage(0);
+    };
+
+    const isFiltered = filteredData.length < data.length;
+
     return (
         <div className="rounded-md border bg-card text-card-foreground">
             {data.length > 5 && (
-                <div className="px-3 py-2 border-b">
-                    <div className="relative">
+                <div className="px-3 py-2 border-b flex items-center gap-2">
+                    <div className="relative flex-1">
                         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
                         <Input
                             placeholder="Search all columns..."
@@ -86,6 +153,38 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
                             value={searchQuery}
                             onChange={(e) => { setSearchQuery(e.target.value); setTablePage(0); }}
                         />
+                    </div>
+                    {/* Export dropdown */}
+                    <div className="relative">
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 px-2.5 text-xs gap-1"
+                            onClick={() => setShowExportMenu((v) => !v)}
+                        >
+                            <Download className="h-3 w-3" />
+                            Export
+                            <ChevronDown className="h-3 w-3 opacity-50" />
+                        </Button>
+                        {showExportMenu && (
+                            <>
+                                <div className="fixed inset-0 z-40" onClick={() => setShowExportMenu(false)} />
+                                <div className="absolute right-0 top-full mt-1 z-50 border rounded-md bg-popover shadow-md py-1 min-w-[100px]">
+                                    {(["csv", "tsv", "json"] as ExportFormat[]).map((fmt) => (
+                                        <button
+                                            key={fmt}
+                                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-muted transition-colors"
+                                            onClick={() => {
+                                                exportData(sortedData, fmt, "export");
+                                                setShowExportMenu(false);
+                                            }}
+                                        >
+                                            {fmt.toUpperCase()}
+                                        </button>
+                                    ))}
+                                </div>
+                            </>
+                        )}
                     </div>
                 </div>
             )}
@@ -110,6 +209,22 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
                                 </TableHead>
                             ))}
                         </TableRow>
+                        {/* Per-column filter row */}
+                        {data.length > 5 && (
+                            <TableRow className="bg-muted/20">
+                                {headers.map((header) => (
+                                    <TableHead key={`filter-${header}`} className="py-1 px-1">
+                                        <Input
+                                            placeholder="Filter…"
+                                            className="h-6 text-[10px] px-1.5 border-muted-foreground/20 bg-background"
+                                            value={columnFilters[header] || ""}
+                                            onChange={(e) => updateColumnFilter(header, e.target.value)}
+                                            onClick={(e) => e.stopPropagation()}
+                                        />
+                                    </TableHead>
+                                ))}
+                            </TableRow>
+                        )}
                     </TableHeader>
                     <TableBody>
                         {displayData.map((row, i) => (
@@ -131,7 +246,9 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
             </ScrollArea>
             <div className="px-3 py-2 border-t flex items-center justify-between text-xs text-muted-foreground">
                 <span>
-                    {data.length} rows{filteredData.length < data.length ? ` (${filteredData.length} filtered)` : ""}
+                    {isFiltered
+                        ? `${filteredData.length} of ${data.length} rows shown`
+                        : `${data.length} rows`}
                 </span>
                 {totalPages > 1 && (
                     <div className="flex items-center gap-2">

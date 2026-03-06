@@ -15,9 +15,9 @@ import {
     Wand2,
     Sparkles,
     FileArchive,
-    MousePointer2,
     AlertCircle,
     Cpu,
+    ChevronUp,
 } from "lucide-react"
 
 import {
@@ -33,9 +33,32 @@ import {
     SidebarMenuItem,
     SidebarRail,
 } from "@/components/ui/sidebar"
-import { useActiveModel } from "@/lib/hooks"
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuRadioGroup,
+    DropdownMenuRadioItem,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { useActiveModel, useConfiguredProviders } from "@/lib/hooks"
 import { useAppStore } from "@/lib/store"
+import Link from "next/link"
 import { toast } from "sonner"
+import { SettingsSheet } from "@/components/SettingsSheet"
+
+const PROVIDER_LABELS: Record<string, string> = {
+    openai: "OpenAI",
+    anthropic: "Anthropic",
+    google: "Google",
+    groq: "Groq",
+    together: "Together",
+    azure: "Azure",
+    openrouter: "OpenRouter",
+    ollama: "Ollama",
+    lmstudio: "LM Studio",
+    custom: "Custom",
+}
 
 const data = {
     navMain: [
@@ -83,11 +106,6 @@ const data = {
                     icon: Bot,
                 },
                 {
-                    title: "Manual Coder",
-                    url: "/manual-coder",
-                    icon: MousePointer2,
-                },
-                {
                     title: "Model Comparison",
                     url: "/model-comparison",
                     icon: Columns,
@@ -122,34 +140,80 @@ const data = {
     ],
 }
 
-function ModelIndicator() {
+function ProviderSelector({ onOpenSettings }: { onOpenSettings: () => void }) {
     const model = useActiveModel()
+    const configured = useConfiguredProviders()
+    const activeProviderId = useAppStore((s) => s.activeProviderId)
+    const setActiveProvider = useAppStore((s) => s.setActiveProvider)
 
+    // 0 providers configured: amber warning
     if (!model) {
         return (
-            <a
-                href="/settings"
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-xs text-amber-600 bg-amber-50 dark:bg-amber-950/30 dark:text-amber-400 hover:opacity-80 transition-opacity border border-amber-200 dark:border-amber-800"
+            <button
+                onClick={onOpenSettings}
+                className="flex items-center gap-2 px-3 py-2 rounded-md text-xs text-amber-600 bg-amber-50 dark:bg-amber-950/30 dark:text-amber-400 hover:opacity-80 transition-opacity border border-amber-200 dark:border-amber-800 w-full text-left"
             >
                 <AlertCircle className="h-3.5 w-3.5 shrink-0" />
                 <span className="truncate">No model configured</span>
-            </a>
+            </button>
         )
     }
 
-    return (
-        <a
-            href="/settings"
-            className="flex items-center gap-2 px-3 py-2 rounded-md text-xs hover:bg-muted/50 transition-colors border border-border"
-        >
-            <Cpu className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <div className="flex-1 min-w-0">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground leading-none mb-0.5">
-                    {model.providerId}
+    // 1 provider configured: non-interactive indicator
+    if (configured.length <= 1) {
+        return (
+            <button
+                onClick={onOpenSettings}
+                className="flex items-center gap-2 px-3 py-2 rounded-md text-xs hover:bg-muted/50 transition-colors border border-border w-full text-left"
+            >
+                <Cpu className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <div className="flex-1 min-w-0">
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground leading-none mb-0.5">
+                        {PROVIDER_LABELS[model.providerId] ?? model.providerId}
+                    </div>
+                    <div className="font-medium truncate leading-none">{model.defaultModel}</div>
                 </div>
-                <div className="font-medium truncate leading-none">{model.defaultModel}</div>
-            </div>
-        </a>
+            </button>
+        )
+    }
+
+    // 2+ providers: dropdown with radio group
+    const value = activeProviderId ?? "__auto__"
+
+    return (
+        <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+                <button className="flex items-center gap-2 px-3 py-2 rounded-md text-xs hover:bg-muted/50 transition-colors border border-border w-full text-left">
+                    <Cpu className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <div className="flex-1 min-w-0">
+                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground leading-none mb-0.5">
+                            {PROVIDER_LABELS[model.providerId] ?? model.providerId}
+                        </div>
+                        <div className="font-medium truncate leading-none">{model.defaultModel}</div>
+                    </div>
+                    <ChevronUp className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="top" align="start" className="w-[220px]">
+                <DropdownMenuRadioGroup
+                    value={value}
+                    onValueChange={(v) => setActiveProvider(v === "__auto__" ? null : v)}
+                >
+                    <DropdownMenuRadioItem value="__auto__">
+                        Auto (first available)
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuSeparator />
+                    {configured.map((p) => (
+                        <DropdownMenuRadioItem key={p.providerId} value={p.providerId}>
+                            <div className="min-w-0">
+                                <div className="text-sm">{PROVIDER_LABELS[p.providerId] ?? p.providerId}</div>
+                                <div className="text-[10px] text-muted-foreground truncate">{p.defaultModel}</div>
+                            </div>
+                        </DropdownMenuRadioItem>
+                    ))}
+                </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+        </DropdownMenu>
     )
 }
 
@@ -166,9 +230,7 @@ function useLocalProviderDetection() {
         const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
         const fetchDetected = isTauri
-            ? // In Tauri (no API routes): probe Ollama and LM Studio directly from the browser.
-              // The desktop WebView has no CORS restrictions for localhost requests.
-              Promise.all([
+            ? Promise.all([
                   fetch("http://localhost:11434/api/tags").then((r) => r.json()).catch(() => null),
                   fetch("http://localhost:1234/v1/models").then((r) => r.json()).catch(() => null),
               ]).then(([ollama, lm]) => {
@@ -210,57 +272,74 @@ function useLocalProviderDetection() {
                     }
                 }
             })
-            .catch(() => {}); // silent if not running
+            .catch(() => {});
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []); // run once on mount — isTauri is stable
+    }, []);
 }
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     useLocalProviderDetection();
+    const [settingsOpen, setSettingsOpen] = React.useState(false);
+
     return (
-        <Sidebar collapsible="icon" {...props}>
-            <SidebarHeader>
-                <SidebarMenu>
-                    <SidebarMenuItem>
-                        <SidebarMenuButton size="lg" asChild>
-                            <a href="/">
-                                <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-                                    <LayoutDashboard className="size-4" />
-                                </div>
-                                <div className="flex flex-col gap-0.5 leading-none">
-                                    <span className="font-semibold">Handai</span>
-                                    <span className="">AI Data Suite</span>
-                                </div>
-                            </a>
-                        </SidebarMenuButton>
-                    </SidebarMenuItem>
-                </SidebarMenu>
-            </SidebarHeader>
-            <SidebarContent>
-                {data.navMain.map((group) => (
-                    <SidebarGroup key={group.title}>
-                        <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
-                        <SidebarGroupContent>
-                            <SidebarMenu>
-                                {group.items.map((item) => (
-                                    <SidebarMenuItem key={item.title}>
-                                        <SidebarMenuButton asChild tooltip={item.title}>
-                                            <a href={item.url}>
-                                                <item.icon />
-                                                <span>{item.title}</span>
-                                            </a>
-                                        </SidebarMenuButton>
-                                    </SidebarMenuItem>
-                                ))}
-                            </SidebarMenu>
-                        </SidebarGroupContent>
-                    </SidebarGroup>
-                ))}
-            </SidebarContent>
-            <SidebarFooter className="p-2">
-                <ModelIndicator />
-            </SidebarFooter>
-            <SidebarRail />
-        </Sidebar>
+        <>
+            <Sidebar collapsible="icon" {...props}>
+                <SidebarHeader>
+                    <SidebarMenu>
+                        <SidebarMenuItem>
+                            <SidebarMenuButton size="lg" asChild>
+                                <Link href="/">
+                                    <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+                                        <LayoutDashboard className="size-4" />
+                                    </div>
+                                    <div className="flex flex-col gap-0.5 leading-none">
+                                        <span className="font-semibold">Handai</span>
+                                        <span className="">AI Data Suite</span>
+                                    </div>
+                                </Link>
+                            </SidebarMenuButton>
+                        </SidebarMenuItem>
+                    </SidebarMenu>
+                </SidebarHeader>
+                <SidebarContent>
+                    {data.navMain.map((group) => (
+                        <SidebarGroup key={group.title}>
+                            <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
+                            <SidebarGroupContent>
+                                <SidebarMenu>
+                                    {group.items.map((item) =>
+                                        item.title === "Settings" ? (
+                                            <SidebarMenuItem key={item.title}>
+                                                <SidebarMenuButton
+                                                    tooltip={item.title}
+                                                    onClick={() => setSettingsOpen(true)}
+                                                >
+                                                    <item.icon />
+                                                    <span>{item.title}</span>
+                                                </SidebarMenuButton>
+                                            </SidebarMenuItem>
+                                        ) : (
+                                            <SidebarMenuItem key={item.title}>
+                                                <SidebarMenuButton asChild tooltip={item.title}>
+                                                    <Link href={item.url}>
+                                                        <item.icon />
+                                                        <span>{item.title}</span>
+                                                    </Link>
+                                                </SidebarMenuButton>
+                                            </SidebarMenuItem>
+                                        )
+                                    )}
+                                </SidebarMenu>
+                            </SidebarGroupContent>
+                        </SidebarGroup>
+                    ))}
+                </SidebarContent>
+                <SidebarFooter className="p-2">
+                    <ProviderSelector onOpenSettings={() => setSettingsOpen(true)} />
+                </SidebarFooter>
+                <SidebarRail />
+            </Sidebar>
+            <SettingsSheet open={settingsOpen} onOpenChange={setSettingsOpen} />
+        </>
     )
 }

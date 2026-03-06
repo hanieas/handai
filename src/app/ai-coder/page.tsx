@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/collapsible";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
 import { downloadCSV } from "@/lib/export";
-import { useActiveModel } from "@/lib/hooks";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
 import {
   ChevronRight,
   ChevronDown,
@@ -41,6 +41,7 @@ import { cn } from "@/lib/utils";
 import Link from "next/link";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { processRowDirect } from "@/lib/llm-browser";
+import { createRun, saveResults } from "@/lib/db-tauri";
 
 // ─── Palette (matches Python CODE_COLORS) ─────────────────────────────────
 const CODE_COLORS = [
@@ -230,7 +231,6 @@ export default function AICoderPage() {
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchProgress, setBatchProgress] = useState(0);
-  const [batchConcurrency, setBatchConcurrency] = useState(3);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [codesInput, setCodesInput] = useState("Positive\nNegative\nNeutral\nDetailed\nBrief");
   const batchAbortRef = useRef(false);
@@ -245,6 +245,8 @@ export default function AICoderPage() {
   const [pendingLoad, setPendingLoad] = useState<{ data: Row[]; name: string; sampleKey?: string } | null>(null);
 
   const activeModel = useActiveModel();
+  const systemSettings = useSystemSettings();
+  const [batchConcurrency, setBatchConcurrency] = useState(systemSettings.maxConcurrency);
 
   useEffect(() => {
     setSettings(loadSettings());
@@ -446,7 +448,7 @@ Only use codes from the list. Confidence 0.0–1.0.`;
           baseUrl: activeModel.baseUrl,
           systemPrompt,
           userContent: rowText,
-          temperature: 0,
+          temperature: systemSettings.temperature,
         });
       } else {
         const res = await fetch("/api/process-row", {
@@ -459,9 +461,10 @@ Only use codes from the list. Confidence 0.0–1.0.`;
             baseUrl: activeModel.baseUrl,
             systemPrompt,
             userContent: rowText,
-            temperature: 0,
+            temperature: systemSettings.temperature,
           }),
         });
+        if (!res.ok) throw new Error(`Server error ${res.status}`);
         result = await res.json();
       }
       if (result.error) throw new Error(result.error);
@@ -487,17 +490,7 @@ Only use codes from the list. Confidence 0.0–1.0.`;
 
       setAiData((prev) => ({ ...prev, [idx]: suggestion }));
 
-      // Auto-apply high-confidence codes (only when called for current row)
-      if (rowIdx === undefined) {
-        const autoApply = suggestion.codes.filter((c) => (suggestion.confidence[c] ?? 0) >= settings.autoAcceptThreshold);
-        if (autoApply.length > 0) {
-          setCodingData((prev) => {
-            const cur = prev[idx] || [];
-            return { ...prev, [idx]: [...new Set([...cur, ...autoApply])] };
-          });
-          toast.success(`Auto-applied ${autoApply.length} high-confidence code${autoApply.length > 1 ? "s" : ""}`);
-        }
-      }
+      // Suggestions stored — user must explicitly accept them
       return suggestion;
     } catch (err) {
       if (rowIdx === undefined) toast.error(`AI failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -513,11 +506,33 @@ Only use codes from the list. Confidence 0.0–1.0.`;
     setBatchProgress(0);
     batchAbortRef.current = false;
     let processed = 0;
+
+    // Create a history run
+    let localRunId: string | null = null;
+    try {
+      const runParams = { runType: "ai-coder", provider: activeModel.providerId, model: activeModel.defaultModel, temperature: systemSettings.temperature, systemPrompt: "AI qualitative coding", inputFile: dataName || "unnamed", inputRows: data.length };
+      if (isTauri) {
+        const rd = await createRun(runParams);
+        localRunId = rd.id ?? null;
+      } else {
+        const res = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(runParams) });
+        if (!res.ok) throw new Error(`Server error ${res.status}`);
+        const rd = await res.json();
+        localRunId = rd.id ?? null;
+      }
+    } catch (err) { console.warn("Run creation failed:", err); }
+
+    const batchResults: { rowIndex: number; output: string; latency: number }[] = [];
     const limit = pLimit(batchConcurrency);
     const tasks = data.map((_, i) =>
       limit(async () => {
         if (batchAbortRef.current) return;
-        await getAiSuggestion(i);
+        const t0 = performance.now();
+        const suggestion = await getAiSuggestion(i);
+        const latency = (performance.now() - t0) / 1000;
+        if (suggestion) {
+          batchResults.push({ rowIndex: i, output: JSON.stringify(suggestion), latency });
+        }
         processed++;
         setBatchProgress(processed);
       })
@@ -525,6 +540,25 @@ Only use codes from the list. Confidence 0.0–1.0.`;
     await Promise.all(tasks);
     setBatchRunning(false);
     toast.success(`AI processed ${processed} rows`);
+
+    // Save results to history
+    if (localRunId && batchResults.length > 0) {
+      try {
+        const resultRows = batchResults.map((r) => ({
+          rowIndex: r.rowIndex,
+          input: data[r.rowIndex] as Record<string, unknown>,
+          output: r.output,
+          status: "success" as const,
+          latency: r.latency,
+        }));
+        if (isTauri) {
+          await saveResults(localRunId, resultRows);
+        } else {
+          const saveRes = await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: localRunId, results: resultRows }) });
+          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
+        }
+      } catch (err) { console.warn("Failed to save results to history:", err); }
+    }
   };
 
   const stopBatch = () => { batchAbortRef.current = true; setBatchRunning(false); };
@@ -837,7 +871,7 @@ Only use codes from the list. Confidence 0.0–1.0.`;
                   isApplied ? "font-semibold shadow-sm" : "font-normal"
                 )}
                 style={{
-                  backgroundColor: isApplied ? color : isSuggested ? color + "55" : "transparent",
+                  backgroundColor: isApplied ? color : isSuggested ? color + "30" : "transparent",
                   borderTopWidth: "4px",
                   borderTopColor: color,
                   borderRightColor: isApplied ? color : isSuggested ? color : "#e2e8f0",
@@ -867,7 +901,7 @@ Only use codes from the list. Confidence 0.0–1.0.`;
                 onClick={() => toggleCode(code)}
                 className="relative w-full rounded border text-sm py-2 px-4 text-left transition-all hover:shadow-sm active:scale-[0.99] flex items-center justify-between"
                 style={{
-                  backgroundColor: isApplied ? color : isSuggested ? color + "55" : "transparent",
+                  backgroundColor: isApplied ? color : isSuggested ? color + "30" : "transparent",
                   borderTopColor: isApplied ? color : isSuggested ? color : "#e2e8f0",
                   borderRightColor: isApplied ? color : isSuggested ? color : "#e2e8f0",
                   borderBottomColor: isApplied ? color : isSuggested ? color : "#e2e8f0",
@@ -911,6 +945,40 @@ Only use codes from the list. Confidence 0.0–1.0.`;
                 : <Sparkles className="h-3 w-3 mr-1.5 text-orange-500" />}
               {currentSuggestion ? "Refresh AI" : "✨ Ask AI"}
             </Button>
+            {currentSuggestion && currentSuggestion.codes.length > 0 && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-green-200 hover:bg-green-50 text-xs"
+                  onClick={() => {
+                    setCodingData((prev) => {
+                      const cur = prev[currentIndex] || [];
+                      return { ...prev, [currentIndex]: [...new Set([...cur, ...currentSuggestion.codes])] };
+                    });
+                    toast.success("Accepted all AI suggestions");
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5 mr-1" />
+                  Accept All AI
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs text-muted-foreground"
+                  onClick={() => {
+                    setAiData((prev) => {
+                      const next = { ...prev };
+                      delete next[currentIndex];
+                      return next;
+                    });
+                  }}
+                >
+                  <X className="h-3.5 w-3.5 mr-1" />
+                  Dismiss
+                </Button>
+              </>
+            )}
             {currentSuggestion?.codes.length ? (
               <span className="text-[11px] text-orange-600 flex items-center gap-1">
                 AI suggests: {currentSuggestion.codes.join(", ")}

@@ -1,5 +1,16 @@
-import { Bot, Database, Edit3, Users, Wand2, Columns, History, BookOpen, Sparkles, FileArchive, ArrowRight } from "lucide-react";
+"use client";
+
+import { Bot, Database, Edit3, Users, Wand2, Columns, History, BookOpen, Sparkles, FileArchive, ArrowRight, MoreVertical, Printer, Video, RefreshCw, Settings, Clock } from "lucide-react";
 import Link from "next/link";
+import { toast } from "sonner";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
 
 const CATEGORIES = [
   {
@@ -31,15 +42,6 @@ const CATEGORIES = [
         color: "text-orange-400",
         bg: "bg-orange-50 dark:bg-orange-950/30",
         border: "hover:border-orange-200 dark:hover:border-orange-800",
-      },
-      {
-        title: "Manual Coder",
-        description: "High-speed manual coding interface with session persistence.",
-        icon: Edit3,
-        href: "/manual-coder",
-        color: "text-green-500",
-        bg: "bg-green-50 dark:bg-green-950/30",
-        border: "hover:border-green-200 dark:hover:border-green-800",
       },
       {
         title: "Codebook Generator",
@@ -123,11 +125,48 @@ export default function HomePage() {
     <div className="max-w-5xl mx-auto space-y-10 pb-16 animate-in fade-in duration-500">
 
       {/* Hero */}
-      <div className="space-y-2 pb-2">
-        <h1 className="text-4xl font-bold tracking-tight">Welcome to Handai</h1>
-        <p className="text-lg text-muted-foreground">
-          Your AI-powered qualitative research and data science suite.
-        </p>
+      <div className="space-y-2 pb-2 flex items-start justify-between">
+        <div>
+          <h1 className="text-4xl font-bold tracking-tight">Welcome to Handai</h1>
+          <p className="text-lg text-muted-foreground">
+            Your AI-powered qualitative research and data science suite.
+          </p>
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="shrink-0 mt-1">
+              <MoreVertical className="h-5 w-5" />
+              <span className="sr-only">Actions</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => window.print()}>
+              <Printer className="h-4 w-4" />
+              Print Page
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => toast.info("Coming soon")}>
+              <Video className="h-4 w-4" />
+              Screencast
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => window.location.reload()}>
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link href="/settings">
+                <Settings className="h-4 w-4" />
+                Settings
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href="/history">
+                <Clock className="h-4 w-4" />
+                Historical Runs
+              </Link>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       {/* Categories */}

@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
-import { useActiveModel } from "@/lib/hooks";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
 import { downloadCSV } from "@/lib/export";
 import { Download, Loader2, CheckCircle2, AlertCircle, ExternalLink, Plus, Trash2, Upload } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -204,12 +204,12 @@ export default function QualitativeCoderPage() {
   const [results, setResults] = useState<Row[]>([]);
   const [stats, setStats] = useState<{ success: number; errors: number; avgLatency: number } | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
-  const [concurrency, setConcurrency] = useState(5);
 
   const abortRef = useRef(false);
   const startedAtRef = useRef<number>(0);
 
   const provider = useActiveModel();
+  const systemSettings = useSystemSettings();
   const allColumns = data.length > 0 ? Object.keys(data[0]) : [];
 
   // Load persisted state after mount (avoids SSR/client hydration mismatch)
@@ -333,25 +333,28 @@ export default function QualitativeCoderPage() {
     setResults([]);
     setStats(null);
 
-    const limit = pLimit(concurrency);
+    const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [...targetData];
     const latencies: number[] = [];
 
     let localRunId: string | null = null;
     try {
       if (isTauri) {
-        const rd = await createRun({ runType: "qualitative-coder", provider: provider.providerId, model: provider.defaultModel, temperature: 0, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), inputFile: dataName || "unnamed", inputRows: targetData.length });
+        const rd = await createRun({ runType: "qualitative-coder", provider: provider.providerId, model: provider.defaultModel, temperature: systemSettings.temperature, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), inputFile: dataName || "unnamed", inputRows: targetData.length });
         localRunId = rd.id;
       } else {
         const runRes = await fetch("/api/runs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runType: "qualitative-coder", provider: provider.providerId, model: provider.defaultModel, temperature: 0, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), inputFile: dataName || "unnamed", inputRows: targetData.length }),
+          body: JSON.stringify({ runType: "qualitative-coder", provider: provider.providerId, model: provider.defaultModel, temperature: systemSettings.temperature, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), inputFile: dataName || "unnamed", inputRows: targetData.length }),
         });
+        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
         const rd = await runRes.json();
         localRunId = rd.id ?? null;
       }
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
 
     const tasks = targetData.map((row, idx) =>
       limit(async () => {
@@ -363,15 +366,16 @@ export default function QualitativeCoderPage() {
           let outputText: string;
           let latency: number;
           if (isTauri) {
-            const result = await processRowDirect({ provider: provider.providerId, model: provider.defaultModel, apiKey: provider.apiKey || "", baseUrl: provider.baseUrl, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), userContent: JSON.stringify(subset), temperature: 0 });
+            const result = await processRowDirect({ provider: provider.providerId, model: provider.defaultModel, apiKey: provider.apiKey || "", baseUrl: provider.baseUrl, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), userContent: JSON.stringify(subset), temperature: systemSettings.temperature });
             outputText = result.output;
             latency = Math.round(result.latency * 1000);
           } else {
             const res = await fetch("/api/process-row", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ provider: provider.providerId, model: provider.defaultModel, apiKey: provider.apiKey || "local", baseUrl: provider.baseUrl, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), userContent: JSON.stringify(subset), rowIdx: idx, temperature: 0 }),
+              body: JSON.stringify({ provider: provider.providerId, model: provider.defaultModel, apiKey: provider.apiKey || "local", baseUrl: provider.baseUrl, systemPrompt: buildPrompt(systemPrompt, codebook, injectCodebook), userContent: JSON.stringify(subset), rowIdx: idx, temperature: systemSettings.temperature }),
             });
+            if (!res.ok) throw new Error(`Server error ${res.status}`);
             const result = await res.json();
             if (result.error) throw new Error(result.error);
             outputText = result.output;
@@ -399,9 +403,12 @@ export default function QualitativeCoderPage() {
         if (isTauri) {
           await saveResults(localRunId, resultPayload);
         } else {
-          await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: localRunId, results: resultPayload }) });
+          const saveRes = await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: localRunId, results: resultPayload }) });
+          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
         }
-      } catch { /* non-fatal */ }
+      } catch (err) {
+      console.warn("Run/results save failed:", err);
+    }
     }
 
     setRunId(localRunId);
@@ -551,6 +558,23 @@ export default function QualitativeCoderPage() {
             <Button variant="outline" size="sm" disabled={codebook.length === 0} onClick={exportCodebookCSV}>
               <Download className="h-3.5 w-3.5 mr-1.5" />Export CSV
             </Button>
+            <Select onValueChange={(key) => {
+              const cb = SAMPLE_CODEBOOKS[key];
+              if (cb) {
+                setCodebook(cb.map((e) => ({ ...e, id: crypto.randomUUID() })));
+                setInjectCodebook(true);
+                toast.success(`Loaded "${key}" sample codebook`);
+              }
+            }}>
+              <SelectTrigger className="h-8 text-xs w-[160px]">
+                <SelectValue placeholder="Sample codebook…" />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.keys(SAMPLE_CODEBOOKS).map((k) => (
+                  <SelectItem key={k} value={k} className="text-xs">{k.replace(/_/g, " ")}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </div>
 
@@ -735,14 +759,6 @@ export default function QualitativeCoderPage() {
             </div>
           </div>
         )}
-
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <span>Concurrency:</span>
-          <button className="px-2 py-1 border rounded hover:bg-muted transition-colors" onClick={() => setConcurrency(c => Math.max(1, c - 1))}>−</button>
-          <span className="px-3 border-x min-w-[2rem] text-center">{concurrency}</span>
-          <button className="px-2 py-1 border rounded hover:bg-muted transition-colors" onClick={() => setConcurrency(c => Math.min(10, c + 1))}>+</button>
-          <span className="text-xs">(parallel API calls)</span>
-        </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Button variant="outline" size="lg" className="h-12 text-sm border-dashed"

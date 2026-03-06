@@ -9,9 +9,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
 import { downloadCSV } from "@/lib/export";
-import { useActiveModel } from "@/lib/hooks";
+import { useActiveModel, useSystemSettings } from "@/lib/hooks";
 import { getPrompt } from "@/lib/prompts";
 import { processRowDirect } from "@/lib/llm-browser";
+import { createRun, saveResults } from "@/lib/db-tauri";
 import { toast } from "sonner";
 import {
   Dialog, DialogContent, DialogDescription,
@@ -25,6 +26,7 @@ import {
 import Link from "next/link";
 import type { Row } from "@/types";
 import { cn } from "@/lib/utils";
+import { DataTable } from "@/components/tools/DataTable";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -251,6 +253,7 @@ export default function AbstractScreenerPage() {
   });
 
   const activeModel = useActiveModel();
+  const systemSettings = useSystemSettings();
 
   // ── On mount: restore settings + autosave ──────────────────────────────────
   useEffect(() => {
@@ -497,6 +500,10 @@ export default function AbstractScreenerPage() {
       toast.error("Please enter inclusion/exclusion criteria before running AI.");
       return;
     }
+    if (!colMap.title && !colMap.abstract && !colMap.keywords && !colMap.journal) {
+      toast.error("Map at least one column (title, abstract, etc.) before running AI.");
+      return;
+    }
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -507,6 +514,19 @@ export default function AbstractScreenerPage() {
     const systemPrompt = getPrompt("screener.default").replace("{criteria}", criteria.trim());
     const results: Record<number, AIScreenResult> = {};
     let errorCount = 0;
+
+    let localRunId: string | null = null;
+    try {
+      if (isTauri) {
+        const rd = await createRun({ runType: "abstract-screener", provider: activeModel.providerId, model: activeModel.defaultModel, temperature: systemSettings.temperature, systemPrompt, inputFile: dataName || "unnamed", inputRows: data.length });
+        localRunId = rd.id ?? null;
+      } else {
+        const runRes = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runType: "abstract-screener", provider: activeModel.providerId, model: activeModel.defaultModel, temperature: systemSettings.temperature, systemPrompt, inputFile: dataName || "unnamed", inputRows: data.length }) });
+        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
+        const rd = await runRes.json();
+        localRunId = rd.id ?? null;
+      }
+    } catch (err) { console.warn("Run creation failed:", err); }
 
     for (let i = 0; i < data.length; i++) {
       if (ctrl.signal.aborted) break;
@@ -528,7 +548,7 @@ export default function AbstractScreenerPage() {
           const res = await processRowDirect({
             provider: activeModel.providerId, model: activeModel.defaultModel,
             apiKey: activeModel.apiKey || "", baseUrl: activeModel.baseUrl,
-            systemPrompt, userContent, temperature: 0,
+            systemPrompt, userContent, temperature: systemSettings.temperature,
           });
           output = res.output;
         } else {
@@ -538,7 +558,7 @@ export default function AbstractScreenerPage() {
             body: JSON.stringify({
               provider: activeModel.providerId, model: activeModel.defaultModel,
               apiKey: activeModel.apiKey || "local", baseUrl: activeModel.baseUrl,
-              systemPrompt, userContent, temperature: 0,
+              systemPrompt, userContent, temperature: systemSettings.temperature,
             }),
           });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -577,6 +597,26 @@ export default function AbstractScreenerPage() {
       });
       return merged;
     });
+
+    // Save results to history
+    if (localRunId) {
+      try {
+        const resultRows = Object.entries(results).map(([idx, r]) => ({
+          rowIndex: Number(idx),
+          input: data[Number(idx)] as Record<string, unknown>,
+          output: JSON.stringify(r),
+          status: "success" as const,
+          latency: r.latency,
+        }));
+        if (isTauri) {
+          await saveResults(localRunId, resultRows);
+        } else {
+          const saveRes = await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: localRunId, results: resultRows }) });
+          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
+        }
+      } catch (err) { console.warn("Failed to save results to history:", err); }
+    }
+
     setIsBatching(false);
     setSkipConfigPanel(true);
 
@@ -892,6 +932,15 @@ export default function AbstractScreenerPage() {
                   </Button>
                 </div>
               </div>
+            </div>
+
+            {/* Data preview */}
+            <div className="border rounded-xl overflow-hidden">
+              <div className="px-4 py-3 border-b bg-muted/20 text-sm font-medium flex justify-between items-center">
+                <span>Data Preview</span>
+                <span className="text-xs text-muted-foreground font-normal">first 5 of {data.length} rows</span>
+              </div>
+              <DataTable data={data} maxRows={5} />
             </div>
 
           </div>
