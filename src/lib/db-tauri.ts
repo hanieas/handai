@@ -93,23 +93,36 @@ export async function createRun(params: RunCreateParams): Promise<{ id: string }
 export async function listRuns(
   limit = 50,
   offset = 0
-): Promise<{ runs: RunMeta[]; total: number; limit: number; offset: number }> {
+): Promise<{ runs: RunMeta[]; total: number; limit: number; offset: number; stats: { totalSessions: number; totalRuns: number; totalSuccess: number; totalError: number } }> {
   const db = await getDb();
 
-  const [rows, countRows] = await Promise.all([
-    db.select<RunMeta[]>(
+  const [rows, countRows, statsRows] = await Promise.all([
+    db.select(
       `SELECT r.*,
               (SELECT COUNT(*) FROM run_results rr WHERE rr.runId = r.id) AS resultCount
        FROM runs r
        ORDER BY r.startedAt DESC
        LIMIT ? OFFSET ?`,
       [limit, offset]
-    ),
-    db.select<[{ total: number }]>(`SELECT COUNT(*) AS total FROM runs`),
+    ) as Promise<RunMeta[]>,
+    db.select(`SELECT COUNT(*) AS total FROM runs`) as Promise<[{ total: number }]>,
+    db.select(
+      `SELECT COUNT(DISTINCT sessionId) as totalSessions,
+              COALESCE(SUM(successCount), 0) as totalSuccess,
+              COALESCE(SUM(errorCount), 0) as totalError
+       FROM runs`
+    ) as Promise<[{ totalSessions: number; totalSuccess: number; totalError: number }]>,
   ]);
 
   const total = countRows[0]?.total ?? 0;
-  return { runs: rows, total, limit, offset };
+  const statsRow = statsRows[0];
+  const stats = {
+    totalSessions: statsRow?.totalSessions ?? 0,
+    totalRuns: total,
+    totalSuccess: statsRow?.totalSuccess ?? 0,
+    totalError: statsRow?.totalError ?? 0,
+  };
+  return { runs: rows, total, limit, offset, stats };
 }
 
 // ── Get single run + results ───────────────────────────────────────────────────
@@ -120,11 +133,11 @@ export async function getRun(
   const db = await getDb();
 
   const [runs, results] = await Promise.all([
-    db.select<RunMeta[]>(`SELECT * FROM runs WHERE id = ?`, [id]),
-    db.select<unknown[]>(
+    db.select(`SELECT * FROM runs WHERE id = ?`, [id]) as Promise<RunMeta[]>,
+    db.select(
       `SELECT * FROM run_results WHERE runId = ? ORDER BY rowIndex ASC`,
       [id]
-    ),
+    ) as Promise<unknown[]>,
   ]);
 
   if (!runs.length) return null;

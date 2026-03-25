@@ -102,7 +102,7 @@ const FieldDefSchema = z.object({
   description: z.string(),
 });
 
-const DocumentFileTypeEnum = z.enum(['pdf', 'docx', 'txt', 'md', 'json', 'html', 'csv']);
+const DocumentFileTypeEnum = z.enum(['pdf', 'docx', 'excel', 'txt', 'md', 'json', 'html', 'csv']);
 
 // ── /api/document-extract ─────────────────────────────────────────────────────
 export const DocumentExtractSchema = z.object({
@@ -126,6 +126,7 @@ export const DocumentAnalyzeSchema = z.object({
   model: z.string().min(1),
   apiKey: z.string().default(""),
   baseUrl: z.string().optional(),
+  hint: z.string().optional(),
 });
 
 // ── /api/runs POST ────────────────────────────────────────────────────────────

@@ -96,6 +96,30 @@ async function extractText(fileContent: string, fileType: string): Promise<Extra
     return { text: truncated ? rawText.slice(0, CHAR_LIMIT) : rawText, truncated, charCount };
   }
 
+  if (fileType === "excel") {
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(buffer, { type: "buffer" });
+      const lines: string[] = [];
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        const csv = XLSX.utils.sheet_to_csv(sheet);
+        if (csv.trim()) {
+          if (workbook.SheetNames.length > 1) lines.push(`--- Sheet: ${sheetName} ---`);
+          lines.push(csv.trim());
+        }
+      }
+      const text = lines.join("\n\n");
+      if (!text) throw new Error("This Excel file appears to be empty.");
+      const charCount = text.length;
+      const truncated = charCount > CHAR_LIMIT;
+      return { text: truncated ? text.slice(0, CHAR_LIMIT) : text, truncated, charCount };
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("empty")) throw err;
+      throw new Error(`Excel file could not be read: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   if (fileType === "docx") {
     try {
       const mammoth = await import("mammoth");

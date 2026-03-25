@@ -10,11 +10,10 @@ const nextConfig: NextConfig = {
   // Tauri dev mode loads the Next.js dev server from 127.0.0.1 (not localhost),
   // triggering a cross-origin warning. Explicitly allow it to silence the noise.
   allowedDevOrigins: ["127.0.0.1"],
-  // pdf-parse v2 uses pdfjs-dist internally. When Turbopack bundles pdfjs-dist into
-  // server chunks, pdfjs cannot find its worker file relative to the chunk path.
-  // Marking these as external forces Next.js to load them from node_modules at
-  // runtime (via require), where pdfjs can resolve the worker correctly.
-  serverExternalPackages: ["pdf-parse", "pdfjs-dist"],
+  // pdf-parse v2 and pdfjs-dist v4 are ESM-only packages. They CANNOT be listed
+  // in serverExternalPackages because that path uses require(), which fails on ESM.
+  // Let Turbopack bundle them normally. The server-side code already disables the
+  // pdfjs worker (workerSrc = "") so no worker resolution is needed at runtime.
 };
 
 export default nextConfig;

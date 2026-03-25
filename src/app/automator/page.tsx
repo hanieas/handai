@@ -1,31 +1,34 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { FileUploader } from "@/components/tools/FileUploader";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { UploadPreview } from "@/components/tools/UploadPreview";
+import { NoModelWarning } from "@/components/tools/NoModelWarning";
 import { DataTable } from "@/components/tools/DataTable";
-import { SampleDatasetPicker } from "@/components/tools/SampleDatasetPicker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
+import { AIInstructionsSection } from "@/components/tools/AIInstructionsSection";
+import { useAIInstructions, AI_INSTRUCTIONS_MARKER } from "@/hooks/useAIInstructions";
 import { useActiveModel, useSystemSettings } from "@/lib/hooks";
+import {
+  dispatchCreateRun,
+  dispatchSaveResults,
+  dispatchAutomatorRow,
+} from "@/lib/llm-dispatch";
 import {
   Plus,
   X,
   ArrowRight,
-  Download,
   Loader2,
-  CheckCircle2,
   Settings2,
-  AlertCircle,
   ExternalLink,
 } from "lucide-react";
 import { toast } from "sonner";
 import pLimit from "p-limit";
 import Link from "next/link";
-import { automatorRowDirect } from "@/lib/llm-browser";
-import { createRun, saveResults } from "@/lib/db-tauri";
 
 interface OutputField {
   name: string;
@@ -56,8 +59,6 @@ function makeStep(idx: number): Step {
   };
 }
 
-const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-
 export default function AutomatorPage() {
   const [data, setData] = useState<Row[]>([]);
   const [dataName, setDataName] = useState("");
@@ -71,7 +72,6 @@ export default function AutomatorPage() {
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
   const [results, setResults] = useState<Row[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
-
   const provider = useActiveModel();
   const systemSettings = useSystemSettings();
 
@@ -96,9 +96,9 @@ export default function AutomatorPage() {
     toast.success(`Loaded ${newData.length} rows`);
   };
 
-  const loadSample = (key: string) => {
-    const s = SAMPLE_DATASETS[key];
-    if (s) handleDataLoaded(s.data as Row[], s.name);
+  const handleLoadSample = (key: string) => {
+    const ds = SAMPLE_DATASETS[key];
+    if (ds) handleDataLoaded(ds.data as Row[], ds.name);
   };
 
   const addStep = () => setSteps((prev) => [...prev, makeStep(prev.length + 1)]);
@@ -146,19 +146,28 @@ export default function AutomatorPage() {
     return fields;
   };
 
-  const handleExport = () => {
-    if (results.length === 0) return;
-    const csv = [
-      Object.keys(results[0]).join(","),
-      ...results.map((row) => Object.values(row).map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")),
-    ].join("\n");
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `automator_results_${dataName || Date.now()}.csv`;
-    a.click();
-  };
+  const buildAutoInstructions = useCallback(() => {
+    const lines: string[] = [];
+    lines.push("You are a multi-step data pipeline assistant.");
+    lines.push("");
+    lines.push("PIPELINE STEPS:");
+    steps.forEach((step, idx) => {
+      lines.push(`Step ${idx + 1}: ${step.name}`);
+      if (step.task) lines.push(`  Task: ${step.task}`);
+      if (step.input_fields.length > 0) lines.push(`  Input: ${step.input_fields.join(", ")}`);
+      if (step.output_fields.length > 0) lines.push(`  Output: ${step.output_fields.map(f => f.name).join(", ")}`);
+    });
+    lines.push("");
+    lines.push("RULES:");
+    lines.push("- Execute each step in order");
+    lines.push("- Return only the pipeline output fields");
+    lines.push("- Do not include any explanation or commentary — return only the result unless the user explicitly requests an explanation");
+    lines.push("");
+    lines.push(AI_INSTRUCTIONS_MARKER);
+    return lines.join("\n");
+  }, [steps]);
+
+  const [aiInstructions, setAiInstructions] = useAIInstructions(buildAutoInstructions);
 
   const runAutomator = async (mode: RunMode) => {
     if (data.length === 0) return toast.error("No data loaded");
@@ -179,49 +188,24 @@ export default function AutomatorPage() {
     const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [];
 
-    let localRunId: string | null = null;
-    try {
-      if (isTauri) {
-        const rd = await createRun({
-          runType: "automator",
-          provider: provider.providerId,
-          model: provider.defaultModel,
-          temperature: systemSettings.temperature,
-          systemPrompt: JSON.stringify(steps),
-          inputFile: dataName || "unnamed_data",
-          inputRows: targetData.length,
-        });
-        localRunId = rd.id ?? null;
-      } else {
-        const runRes = await fetch("/api/runs", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            runType: "automator",
-            provider: provider.providerId,
-            model: provider.defaultModel,
-            temperature: systemSettings.temperature,
-            systemPrompt: JSON.stringify(steps),
-            inputFile: dataName || "unnamed_data",
-            inputRows: targetData.length,
-          }),
-        });
-        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
-        const rd = await runRes.json();
-        localRunId = rd.id ?? null;
-      }
-    } catch (err) {
-      console.warn("Run/results save failed:", err);
-    }
+    const localRunId = await dispatchCreateRun({
+      runType: "automator",
+      provider: provider.providerId,
+      model: provider.defaultModel,
+      temperature: systemSettings.temperature,
+      systemPrompt: aiInstructions || JSON.stringify(steps),
+      inputFile: dataName || "unnamed_data",
+      inputRows: targetData.length,
+    });
 
     const tasks = targetData.map((row, idx) =>
       limit(async () => {
         if (abortRef.current) return;
         const t0 = Date.now();
-        try {
-          let result: { output: Row; stepResults?: unknown; success?: boolean };
-          if (isTauri) {
-            result = await automatorRowDirect({
+        const MAX_ROW_RETRIES = 3;
+        for (let attempt = 1; attempt <= MAX_ROW_RETRIES; attempt++) {
+          try {
+            const result = await dispatchAutomatorRow({
               row,
               steps,
               provider: provider.providerId,
@@ -229,44 +213,35 @@ export default function AutomatorPage() {
               apiKey: provider.apiKey || "",
               baseUrl: provider.baseUrl,
             });
-          } else {
-            const res = await fetch("/api/automator-row", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                row,
-                steps,
-                provider: provider.providerId,
-                model: provider.defaultModel,
-                apiKey: provider.apiKey || "local",
-                baseUrl: provider.baseUrl,
-              }),
-            });
-            if (!res.ok) throw new Error(`Server error ${res.status}`);
-            const json = await res.json();
-            if (json.error) throw new Error(json.error);
-            result = json;
-          }
 
-          // Check if result.output is essentially the same as input (extraction failed silently)
-          const outputKeys = Object.keys(result.output || {});
-          const inputKeys = Object.keys(row);
-          const newKeys = outputKeys.filter(k => !inputKeys.includes(k) && k !== 'status' && k !== 'latency');
-          if (newKeys.length === 0 && steps.length > 0) {
-            // No new fields added — extraction likely failed
-            newResults[idx] = {
-              ...row,
-              ...result.output,
-              _step_warning: "No new fields extracted — check step configuration",
-              status: "warning",
-              latency: Date.now() - t0,
-            };
-          } else {
-            newResults[idx] = { ...result.output, status: "success", latency: Date.now() - t0 };
+            // Check if result.output is essentially the same as input (extraction failed silently)
+            const outputKeys = Object.keys(result.output || {});
+            const inputKeys = Object.keys(row);
+            const newKeys = outputKeys.filter(k => !inputKeys.includes(k) && k !== 'status' && k !== 'latency');
+            if (newKeys.length === 0 && steps.length > 0 && attempt < MAX_ROW_RETRIES) {
+              await new Promise(r => setTimeout(r, 500 * attempt));
+              continue;
+            }
+            if (newKeys.length === 0 && steps.length > 0) {
+              newResults[idx] = {
+                ...row,
+                ...result.output,
+                _step_warning: "No new fields extracted — check step configuration",
+                status: "warning",
+                latency: Date.now() - t0,
+              };
+            } else {
+              newResults[idx] = { ...result.output, status: "success", latency: Date.now() - t0 };
+            }
+            break;
+          } catch (err) {
+            if (attempt === MAX_ROW_RETRIES) {
+              console.error(err);
+              newResults[idx] = { ...row, automator_error: true, status: "error", errorMessage: String(err), latency: Date.now() - t0 };
+            } else {
+              await new Promise(r => setTimeout(r, 500 * attempt));
+            }
           }
-        } catch (err) {
-          console.error(err);
-          newResults[idx] = { ...row, automator_error: true, status: "error", errorMessage: String(err), latency: Date.now() - t0 };
         }
         setProgress((prev) => ({ ...prev, completed: prev.completed + 1 }));
       })
@@ -276,28 +251,15 @@ export default function AutomatorPage() {
     setResults(newResults);
 
     if (localRunId) {
-      try {
-        const resultRows = newResults.map((r, i) => ({
-          rowIndex: i,
-          input: r,
-          output: r,
-          status: r.status as string,
-          latency: r.latency as number | undefined,
-          errorMessage: r.errorMessage as string | undefined,
-        }));
-        if (isTauri) {
-          await saveResults(localRunId, resultRows);
-        } else {
-          const saveRes = await fetch("/api/results", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ runId: localRunId, results: resultRows }),
-          });
-          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
-        }
-      } catch (err) {
-      console.warn("Run/results save failed:", err);
-    }
+      const resultRows = newResults.map((r, i) => ({
+        rowIndex: i,
+        input: r,
+        output: r,
+        status: r.status as string,
+        latency: r.latency as number | undefined,
+        errorMessage: r.errorMessage as string | undefined,
+      }));
+      await dispatchSaveResults(localRunId, resultRows);
     }
 
     setRunId(localRunId);
@@ -308,10 +270,10 @@ export default function AutomatorPage() {
   const progressPct = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-0 pb-16">
+    <div className="space-y-0 pb-16">
 
       {/* Header */}
-      <div className="pb-6 space-y-1">
+      <div className="pb-6 space-y-1 max-w-3xl">
         <h1 className="text-4xl font-bold">General Automator</h1>
         <p className="text-muted-foreground text-sm">Create and run multi-step AI data pipelines</p>
       </div>
@@ -319,24 +281,26 @@ export default function AutomatorPage() {
       {/* ── 1. Upload Data ────────────────────────────────────────────────── */}
       <div className="space-y-4 pb-8">
         <h2 className="text-2xl font-bold">1. Upload Data</h2>
-        <FileUploader onDataLoaded={handleDataLoaded} />
-        <SampleDatasetPicker onSelect={loadSample} />
-
-        {data.length > 0 && (
-          <>
-            <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-green-50 dark:bg-green-950/20 border border-green-200 text-sm text-green-700 dark:text-green-300">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              <span><strong>{data.length} rows</strong> loaded from <strong>{dataName}</strong></span>
-            </div>
-            <div className="border rounded-lg overflow-hidden">
-              <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium flex justify-between items-center">
-                <span>Data Preview</span>
-                <span className="text-xs text-muted-foreground font-normal">first 5 of {data.length} rows</span>
-              </div>
-              <DataTable data={data} maxRows={5} />
-            </div>
-          </>
-        )}
+        <UploadPreview
+          data={data}
+          dataName={dataName}
+          onDataLoaded={handleDataLoaded}
+          samplePickerPosition="above"
+          customSamplePicker={
+            <Select onValueChange={handleLoadSample}>
+              <SelectTrigger className="w-[200px] h-9 text-xs">
+                <SelectValue placeholder="-- Select a sample..." />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.keys(SAMPLE_DATASETS).map((key) => (
+                  <SelectItem key={key} value={key} className="text-xs">
+                    {SAMPLE_DATASETS[key].name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+        />
       </div>
 
       <div className="border-t" />
@@ -482,9 +446,18 @@ export default function AutomatorPage() {
 
       <div className="border-t" />
 
-      {/* ── 3. Execute ────────────────────────────────────────────────────── */}
+      {/* ── 3. AI Instructions ─────────────────────────────────────────────── */}
+      <AIInstructionsSection
+        sectionNumber={3}
+        value={aiInstructions}
+        onChange={setAiInstructions}
+      />
+
+      <div className="border-t" />
+
+      {/* ── 4. Execute ────────────────────────────────────────────────────── */}
       <div className="space-y-4 py-8">
-        <h2 className="text-2xl font-bold">3. Execute</h2>
+        <h2 className="text-2xl font-bold">4. Execute</h2>
 
         {isProcessing && (
           <div className="space-y-2">
@@ -507,14 +480,7 @@ export default function AutomatorPage() {
           </div>
         )}
 
-        {!provider && (
-          <Link href="/settings">
-            <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 cursor-pointer hover:opacity-90 text-sm text-amber-700">
-              <AlertCircle className="h-4 w-4 shrink-0" />
-              No AI model configured — click here to add an API key in Settings
-            </div>
-          </Link>
-        )}
+        <NoModelWarning activeModel={provider} />
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Button variant="outline" size="lg" className="h-12 text-sm border-dashed"
@@ -553,16 +519,13 @@ export default function AutomatorPage() {
                   View in History
                 </Link>
               )}
-              <Button variant="outline" size="sm" onClick={handleExport}>
-                <Download className="h-4 w-4 mr-2" /> Export CSV
-              </Button>
             </div>
           </div>
           <div className="border rounded-lg overflow-hidden">
             <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium">
               Pipeline Output — {results.length} rows
             </div>
-            <DataTable data={results} />
+            <DataTable data={results} showAll />
           </div>
           {(() => {
             const warnings = results.filter(r => r.status === "warning").length;

@@ -9,7 +9,7 @@ export async function GET(req: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get("limit") ?? "50", 10), 200);
     const offset = parseInt(searchParams.get("offset") ?? "0", 10);
 
-    const [runs, total] = await Promise.all([
+    const [runs, total, totalSessions, aggregate] = await Promise.all([
       prisma.run.findMany({
         orderBy: { startedAt: "desc" },
         take: limit,
@@ -17,9 +17,20 @@ export async function GET(req: NextRequest) {
         include: { _count: { select: { results: true } } },
       }),
       prisma.run.count(),
+      prisma.session.count(),
+      prisma.run.aggregate({
+        _sum: { successCount: true, errorCount: true },
+      }),
     ]);
 
-    return NextResponse.json({ runs, total, limit, offset });
+    const stats = {
+      totalSessions,
+      totalRuns: total,
+      totalSuccess: aggregate._sum.successCount ?? 0,
+      totalError: aggregate._sum.errorCount ?? 0,
+    };
+
+    return NextResponse.json({ runs, total, limit, offset, stats });
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: msg }, { status: 500 });

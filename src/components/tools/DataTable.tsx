@@ -19,15 +19,25 @@ import {
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Search, ChevronLeft, ChevronRight, Download, ChevronDown } from "lucide-react";
+import * as XLSX from "xlsx";
 
 interface DataTableProps {
     data: any[];
     maxRows?: number;
+    showAll?: boolean;
 }
 
-type ExportFormat = "csv" | "tsv" | "json";
+type ExportFormat = "csv" | "tsv" | "json" | "xlsx";
 
 function exportData(data: any[], format: ExportFormat, filename?: string) {
+    if (format === "xlsx") {
+        const ws = XLSX.utils.json_to_sheet(data);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Data");
+        XLSX.writeFile(wb, `${filename || "data"}.xlsx`);
+        return;
+    }
+
     const headers = Object.keys(data[0] || {});
     let content: string;
     let mimeType: string;
@@ -66,7 +76,7 @@ function exportData(data: any[], format: ExportFormat, filename?: string) {
     URL.revokeObjectURL(url);
 }
 
-export function DataTable({ data, maxRows = 100 }: DataTableProps) {
+export function DataTable({ data, maxRows = 100, showAll = false }: DataTableProps) {
     const [expanded, setExpanded] = useState<{ col: string; value: string } | null>(null);
     const [sortCol, setSortCol] = useState<string | null>(null);
     const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -120,9 +130,9 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
           })
         : filteredData;
 
-    // Pagination
-    const totalPages = Math.ceil(sortedData.length / maxRows);
-    const displayData = sortedData.slice(tablePage * maxRows, (tablePage + 1) * maxRows);
+    // Pagination (only when not showAll)
+    const totalPages = showAll ? 1 : Math.ceil(sortedData.length / maxRows);
+    const displayData = showAll ? sortedData : sortedData.slice(tablePage * maxRows, (tablePage + 1) * maxRows);
 
     const handleHeaderClick = (header: string) => {
         if (sortCol === header) {
@@ -142,7 +152,7 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
     const isFiltered = filteredData.length < data.length;
 
     return (
-        <div className="rounded-md border bg-card text-card-foreground">
+        <div className="border border-gray-300 bg-card text-card-foreground">
             {data.length > 5 && (
                 <div className="px-3 py-2 border-b flex items-center gap-2">
                     <div className="relative flex-1">
@@ -170,7 +180,7 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowExportMenu(false)} />
                                 <div className="absolute right-0 top-full mt-1 z-50 border rounded-md bg-popover shadow-md py-1 min-w-[100px]">
-                                    {(["csv", "tsv", "json"] as ExportFormat[]).map((fmt) => (
+                                    {(["csv", "tsv", "json", "xlsx"] as ExportFormat[]).map((fmt) => (
                                         <button
                                             key={fmt}
                                             className="w-full text-left px-3 py-1.5 text-xs hover:bg-muted transition-colors"
@@ -188,69 +198,125 @@ export function DataTable({ data, maxRows = 100 }: DataTableProps) {
                     </div>
                 </div>
             )}
-            <ScrollArea className="h-[400px] w-full rounded-md border">
-                <Table>
-                    <TableHeader className="sticky top-0 bg-secondary/80 backdrop-blur-sm z-10">
-                        <TableRow>
-                            {headers.map((header) => (
-                                <TableHead
-                                    key={header}
-                                    className="font-bold cursor-pointer hover:bg-muted/30 select-none"
-                                    onClick={() => handleHeaderClick(header)}
-                                >
-                                    <div className="flex items-center gap-1">
-                                        {header}
-                                        {sortCol === header && (
-                                            <span className="text-xs opacity-60">
-                                                {sortDir === "asc" ? "↑" : "↓"}
-                                            </span>
-                                        )}
-                                    </div>
-                                </TableHead>
-                            ))}
-                        </TableRow>
-                        {/* Per-column filter row */}
-                        {data.length > 5 && (
-                            <TableRow className="bg-muted/20">
+            {showAll ? (
+                <div className="w-full border-t border-gray-300 overflow-x-auto">
+                    <Table>
+                        <TableHeader className="sticky top-0 bg-gray-100 z-10">
+                            <TableRow>
                                 {headers.map((header) => (
-                                    <TableHead key={`filter-${header}`} className="py-1 px-1">
-                                        <Input
-                                            placeholder="Filter…"
-                                            className="h-6 text-[10px] px-1.5 border-muted-foreground/20 bg-background"
-                                            value={columnFilters[header] || ""}
-                                            onChange={(e) => updateColumnFilter(header, e.target.value)}
-                                            onClick={(e) => e.stopPropagation()}
-                                        />
+                                    <TableHead
+                                        key={header}
+                                        className="font-bold cursor-pointer hover:bg-gray-200 select-none"
+                                        onClick={() => handleHeaderClick(header)}
+                                    >
+                                        <div className="flex items-center gap-1">
+                                            {header}
+                                            {sortCol === header && (
+                                                <span className="text-xs opacity-60">
+                                                    {sortDir === "asc" ? "↑" : "↓"}
+                                                </span>
+                                            )}
+                                        </div>
                                     </TableHead>
                                 ))}
                             </TableRow>
-                        )}
-                    </TableHeader>
-                    <TableBody>
-                        {displayData.map((row, i) => (
-                            <TableRow key={i}>
+                            {data.length > 5 && (
+                                <TableRow className="bg-gray-50">
+                                    {headers.map((header) => (
+                                        <TableHead key={`filter-${header}`} className="py-1 px-1">
+                                            <Input
+                                                placeholder="Filter…"
+                                                className="h-6 text-[10px] px-1.5 border-muted-foreground/20 bg-background"
+                                                value={columnFilters[header] || ""}
+                                                onChange={(e) => updateColumnFilter(header, e.target.value)}
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                        </TableHead>
+                                    ))}
+                                </TableRow>
+                            )}
+                        </TableHeader>
+                        <TableBody>
+                            {displayData.map((row, i) => (
+                                <TableRow key={i}>
+                                    {headers.map((header) => (
+                                        <TableCell
+                                            key={`${i}-${header}`}
+                                            className="whitespace-pre-wrap max-w-md truncate cursor-pointer hover:bg-muted/20"
+                                            onClick={() => setExpanded({ col: header, value: String(row[header] ?? "") })}
+                                        >
+                                            {String(row[header] ?? "")}
+                                        </TableCell>
+                                    ))}
+                                </TableRow>
+                            ))}
+                        </TableBody>
+                    </Table>
+                </div>
+            ) : (
+                <ScrollArea className="h-[400px] w-full border-t border-gray-300">
+                    <Table>
+                        <TableHeader className="sticky top-0 bg-gray-100 z-10">
+                            <TableRow>
                                 {headers.map((header) => (
-                                    <TableCell
-                                        key={`${i}-${header}`}
-                                        className="whitespace-pre-wrap max-w-md truncate cursor-pointer hover:bg-muted/20"
-                                        onClick={() => setExpanded({ col: header, value: String(row[header] ?? "") })}
+                                    <TableHead
+                                        key={header}
+                                        className="font-bold cursor-pointer hover:bg-gray-200 select-none"
+                                        onClick={() => handleHeaderClick(header)}
                                     >
-                                        {String(row[header] ?? "")}
-                                    </TableCell>
+                                        <div className="flex items-center gap-1">
+                                            {header}
+                                            {sortCol === header && (
+                                                <span className="text-xs opacity-60">
+                                                    {sortDir === "asc" ? "↑" : "↓"}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </TableHead>
                                 ))}
                             </TableRow>
-                        ))}
-                    </TableBody>
-                </Table>
-                <ScrollBar orientation="horizontal" />
-            </ScrollArea>
+                            {data.length > 5 && (
+                                <TableRow className="bg-gray-50">
+                                    {headers.map((header) => (
+                                        <TableHead key={`filter-${header}`} className="py-1 px-1">
+                                            <Input
+                                                placeholder="Filter…"
+                                                className="h-6 text-[10px] px-1.5 border-muted-foreground/20 bg-background"
+                                                value={columnFilters[header] || ""}
+                                                onChange={(e) => updateColumnFilter(header, e.target.value)}
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                        </TableHead>
+                                    ))}
+                                </TableRow>
+                            )}
+                        </TableHeader>
+                        <TableBody>
+                            {displayData.map((row, i) => (
+                                <TableRow key={i}>
+                                    {headers.map((header) => (
+                                        <TableCell
+                                            key={`${i}-${header}`}
+                                            className="whitespace-pre-wrap max-w-md truncate cursor-pointer hover:bg-muted/20"
+                                            onClick={() => setExpanded({ col: header, value: String(row[header] ?? "") })}
+                                        >
+                                            {String(row[header] ?? "")}
+                                        </TableCell>
+                                    ))}
+                                </TableRow>
+                            ))}
+                        </TableBody>
+                    </Table>
+                    <ScrollBar orientation="horizontal" />
+                </ScrollArea>
+            )}
             <div className="px-3 py-2 border-t flex items-center justify-between text-xs text-muted-foreground">
                 <span>
                     {isFiltered
                         ? `${filteredData.length} of ${data.length} rows shown`
                         : `${data.length} rows`}
                 </span>
-                {totalPages > 1 && (
+                {!showAll && totalPages > 1 && (
                     <div className="flex items-center gap-2">
                         <span>
                             {tablePage * maxRows + 1}–{Math.min((tablePage + 1) * maxRows, sortedData.length)} of {sortedData.length}

@@ -45,7 +45,7 @@ import { useActiveModel, useConfiguredProviders } from "@/lib/hooks"
 import { useAppStore } from "@/lib/store"
 import Link from "next/link"
 import { toast } from "sonner"
-import { SettingsSheet } from "@/components/SettingsSheet"
+import { useRouter } from "next/navigation"
 
 const PROVIDER_LABELS: Record<string, string> = {
     openai: "OpenAI",
@@ -279,11 +279,10 @@ function useLocalProviderDetection() {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     useLocalProviderDetection();
-    const [settingsOpen, setSettingsOpen] = React.useState(false);
+    const router = useRouter();
 
     return (
-        <>
-            <Sidebar collapsible="icon" {...props}>
+        <Sidebar collapsible="icon" {...props}>
                 <SidebarHeader>
                     <SidebarMenu>
                         <SidebarMenuItem>
@@ -307,39 +306,25 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                             <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
                             <SidebarGroupContent>
                                 <SidebarMenu>
-                                    {group.items.map((item) =>
-                                        item.title === "Settings" ? (
-                                            <SidebarMenuItem key={item.title}>
-                                                <SidebarMenuButton
-                                                    tooltip={item.title}
-                                                    onClick={() => setSettingsOpen(true)}
-                                                >
+                                    {group.items.map((item) => (
+                                        <SidebarMenuItem key={item.title}>
+                                            <SidebarMenuButton asChild tooltip={item.title}>
+                                                <Link href={item.url}>
                                                     <item.icon />
                                                     <span>{item.title}</span>
-                                                </SidebarMenuButton>
-                                            </SidebarMenuItem>
-                                        ) : (
-                                            <SidebarMenuItem key={item.title}>
-                                                <SidebarMenuButton asChild tooltip={item.title}>
-                                                    <Link href={item.url}>
-                                                        <item.icon />
-                                                        <span>{item.title}</span>
-                                                    </Link>
-                                                </SidebarMenuButton>
-                                            </SidebarMenuItem>
-                                        )
-                                    )}
+                                                </Link>
+                                            </SidebarMenuButton>
+                                        </SidebarMenuItem>
+                                    ))}
                                 </SidebarMenu>
                             </SidebarGroupContent>
                         </SidebarGroup>
                     ))}
                 </SidebarContent>
                 <SidebarFooter className="p-2">
-                    <ProviderSelector onOpenSettings={() => setSettingsOpen(true)} />
+                    <ProviderSelector onOpenSettings={() => router.push("/settings")} />
                 </SidebarFooter>
                 <SidebarRail />
-            </Sidebar>
-            <SettingsSheet open={settingsOpen} onOpenChange={setSettingsOpen} />
-        </>
+        </Sidebar>
     )
 }

@@ -8,10 +8,11 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { useAppStore, DEFAULT_SYSTEM_SETTINGS } from "@/lib/store";
-import { useSystemSettings } from "@/lib/hooks";
+import { useSystemSettings, useConfiguredProviders } from "@/lib/hooks";
 import { PROMPTS, getPrompt, setPromptOverride, clearPromptOverride } from "@/lib/prompts";
 import { toast } from "sonner";
 import { Key, ShieldCheck, Loader2, Wifi, RotateCcw, ChevronDown, Bot, Sliders, RefreshCw, SlidersHorizontal, Minus, Plus, FolderOpen } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -30,7 +31,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 const CLOUD_PROVIDERS = ["openai", "anthropic", "google", "groq", "together", "azure", "openrouter"];
 const LOCAL_PROVIDERS = ["ollama", "lmstudio", "custom"];
 
-const PROMPT_CATEGORIES = ["transform", "qualitative", "consensus", "codebook", "generate", "automator", "ai_coder"];
+const PROMPT_CATEGORIES = ["transform", "qualitative", "consensus", "codebook", "generate", "automator", "ai_coder", "document"];
 const PROMPT_CATEGORY_LABELS: Record<string, string> = {
   transform: "Transform Data",
   qualitative: "Qualitative Coder",
@@ -39,6 +40,7 @@ const PROMPT_CATEGORY_LABELS: Record<string, string> = {
   generate: "Generate Data",
   automator: "Automator",
   ai_coder: "AI Coder",
+  document: "Process Documents",
 };
 
 const BASE_URL_PROVIDERS = new Set(["openai", "together", "openrouter", "ollama", "lmstudio", "custom", "azure"]);
@@ -59,6 +61,10 @@ export default function SettingsPage() {
   const systemSettings = useSystemSettings();
   const setSystemSettings = useAppStore((s) => s.setSystemSettings);
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+  const configured = useConfiguredProviders();
+  const activeProviderId = useAppStore((s) => s.activeProviderId);
+  const setActiveProvider = useAppStore((s) => s.setActiveProvider);
 
   useEffect(() => {
     setPromptValues(Object.fromEntries(Object.keys(PROMPTS).map((id) => [id, getPrompt(id)])));
@@ -354,6 +360,31 @@ export default function SettingsPage() {
               The first enabled provider with a configured key is used by default across all tools.
             </p>
           </div>
+
+          {configured.length > 1 && (
+            <div className="rounded-xl border bg-card p-4 space-y-2">
+              <Label className="text-xs font-medium">Default AI Provider</Label>
+              <Select
+                value={activeProviderId ?? "__auto__"}
+                onValueChange={(v) => setActiveProvider(v === "__auto__" ? null : v)}
+              >
+                <SelectTrigger className="h-9 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__auto__" className="text-sm">Auto (first available)</SelectItem>
+                  {configured.map((p) => (
+                    <SelectItem key={p.providerId} value={p.providerId} className="text-sm">
+                      {PROVIDER_LABELS[p.providerId] ?? p.providerId} — {p.defaultModel}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] text-muted-foreground">
+                Choose which provider is used by default across all tools, or leave on Auto to use the first available.
+              </p>
+            </div>
+          )}
 
           <div className="space-y-8">
             <div>

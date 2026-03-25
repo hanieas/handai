@@ -8,15 +8,16 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useActiveModel } from "@/lib/hooks";
-import { AlertCircle, Sparkles, Plus, Trash2, Download, Loader2, Minus, ExternalLink, Upload, ClipboardPaste, Check, X } from "lucide-react";
+import { Sparkles, Plus, Trash2, Download, Loader2, Minus, ExternalLink, Check, X } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
 import type { GenerateColumn, Row } from "@/types";
-import { generateRowDirect, processRowDirect } from "@/lib/llm-browser";
-import { createRun, saveResults } from "@/lib/db-tauri";
+import { dispatchGenerateRow, dispatchProcessRow, dispatchCreateRun, dispatchSaveResults } from "@/lib/llm-dispatch";
+import { NoModelWarning } from "@/components/tools/NoModelWarning";
+import { AIInstructionsSection } from "@/components/tools/AIInstructionsSection";
+import { useAIInstructions, AI_INSTRUCTIONS_MARKER } from "@/hooks/useAIInstructions";
 import { getPrompt } from "@/lib/prompts";
-import { FileUploader } from "@/components/tools/FileUploader";
-import Papa from "papaparse";
+import * as XLSX from "xlsx";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -39,7 +40,7 @@ const SAMPLE_PROMPTS: Record<string, string> = {
 
 const COLUMN_TYPES = ["text", "number", "boolean", "list"] as const;
 
-type OutputFormat = "tabular" | "json" | "freetext";
+type OutputFormat = "tabular" | "json" | "freetext" | "excel";
 type Structure = "ai_decide" | "define_columns" | "use_template";
 type RunMode = "preview" | "test" | "full";
 
@@ -50,28 +51,7 @@ const VARIATION_LEVELS = [
   { label: "Maximum", value: 1.0 },
 ];
 
-const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-function inferColumnType(values: string[]): SuggestedField["type"] {
-  const nonEmpty = values.filter((v) => v.trim() !== "");
-  if (nonEmpty.length === 0) return "text";
-  const boolValues = new Set(["true", "false", "yes", "no", "0", "1"]);
-  if (nonEmpty.every((v) => boolValues.has(v.toLowerCase()))) return "boolean";
-  if (nonEmpty.every((v) => !isNaN(Number(v)) && v.trim() !== "")) return "number";
-  return "text";
-}
-
-function fieldsFromData(data: Record<string, unknown>[]): SuggestedField[] {
-  if (data.length === 0) return [];
-  const keys = Object.keys(data[0]);
-  const sample = data.slice(0, 5);
-  return keys.map((key) => {
-    const values = sample.map((row) => String(row[key] ?? ""));
-    return { name: key, type: inferColumnType(values), description: "", checked: true };
-  });
-}
 
 function parseJsonResponse(text: string): Array<{ name: string; type: string; description: string }> {
   let cleaned = text.trim();
@@ -97,9 +77,7 @@ export default function GeneratePage() {
   const [rowCount, setRowCount] = useState(100);
   const [variationIdx, setVariationIdx] = useState(1); // Medium
   const [columns, setColumns] = useState<GenerateColumn[]>([
-    { name: "id", type: "number", description: "Unique identifier" },
-    { name: "text", type: "text", description: "Main text field" },
-    { name: "label", type: "text", description: "Category label" },
+    { name: "", type: "text" },
   ]);
   const [templateText, setTemplateText] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
@@ -111,18 +89,52 @@ export default function GeneratePage() {
   // ── Suggested fields state ──
   const [suggestedFields, setSuggestedFields] = useState<SuggestedField[]>([]);
   const [isSuggesting, setIsSuggesting] = useState(false);
-  const [showCsvPaste, setShowCsvPaste] = useState(false);
-  const [csvPasteText, setCsvPasteText] = useState("");
-  const [showFileUploader, setShowFileUploader] = useState(false);
+  const [suggestionMode, setSuggestionMode] = useState<"ai" | "manual">("ai");
 
   const temperature = VARIATION_LEVELS[variationIdx].value;
+
+  // ── Auto-generate AI Instructions ──
+  const buildAutoInstructions = useCallback(() => {
+    const lines: string[] = [];
+    lines.push("You are a synthetic data generator. Produce realistic, diverse, high-quality data.");
+    lines.push("");
+
+    if (description.trim()) {
+      lines.push("DATA DESCRIPTION:");
+      lines.push(description.trim());
+      lines.push("");
+    }
+
+    const namedCols = columns.filter((c) => c.name.trim());
+    if (namedCols.length > 0) {
+      lines.push("SCHEMA:");
+      namedCols.forEach((c) => {
+        lines.push(`- ${c.name} (${c.type})${c.description ? `: ${c.description}` : ""}`);
+      });
+      lines.push("");
+    }
+
+    lines.push("OUTPUT RULES:");
+    lines.push(`- Format: ${outputFormat === "excel" ? "tabular" : outputFormat}`);
+    lines.push(`- Rows: ${rowCount}`);
+    lines.push(`- Variation level: ${VARIATION_LEVELS[variationIdx].label} (temperature ${temperature})`);
+    lines.push("");
+    lines.push("STRICTLY FORBIDDEN: markdown, code fences, placeholders, duplicate rows.");
+    lines.push("");
+    lines.push(AI_INSTRUCTIONS_MARKER);
+
+    return lines.join("\n");
+  }, [description, columns, outputFormat, rowCount, variationIdx, temperature]);
+
+  // ── AI Instructions state ──
+  const [aiInstructions, setAiInstructions] = useAIInstructions(buildAutoInstructions);
 
   const addColumn = () => setColumns((prev) => [...prev, { name: "", type: "text" }]);
   const removeColumn = (idx: number) => setColumns((prev) => prev.filter((_, i) => i !== idx));
   const updateColumn = (idx: number, updates: Partial<GenerateColumn>) =>
     setColumns((prev) => prev.map((c, i) => (i === idx ? { ...c, ...updates } : c)));
 
-  const canGenerate = description.trim().length > 0 || structure === "define_columns";
+  const canGenerate = description.trim().length > 0 && columns.some((c) => c.name.trim());
 
   // ── Suggested fields helpers ──
 
@@ -155,33 +167,14 @@ export default function GeneratePage() {
     setIsSuggesting(true);
     try {
       const systemPrompt = getPrompt("generate.column_suggestions");
-      let output: string;
-      if (isTauri) {
-        const res = await processRowDirect({
-          provider: activeModel.providerId,
-          model: activeModel.defaultModel,
-          apiKey: activeModel.apiKey || "",
-          baseUrl: activeModel.baseUrl,
-          systemPrompt,
-          userContent: description,
-        });
-        output = res.output;
-      } else {
-        const res = await fetch("/api/process-row", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            provider: activeModel.providerId,
-            model: activeModel.defaultModel,
-            apiKey: activeModel.apiKey || "local",
-            baseUrl: activeModel.baseUrl,
-            systemPrompt,
-            userContent: description,
-          }),
-        });
-        const data = await res.json();
-        output = data.output ?? "";
-      }
+      const { output } = await dispatchProcessRow({
+        provider: activeModel.providerId,
+        model: activeModel.defaultModel,
+        apiKey: activeModel.apiKey || "",
+        baseUrl: activeModel.baseUrl,
+        systemPrompt,
+        userContent: description,
+      });
       const parsed = parseJsonResponse(output);
       if (parsed.length === 0) {
         toast.error("Could not parse AI suggestions. Try again.");
@@ -195,8 +188,6 @@ export default function GeneratePage() {
         checked: true,
       }));
       setSuggestedFields(fields);
-      setShowCsvPaste(false);
-      setShowFileUploader(false);
       toast.success(`${fields.length} fields suggested`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -206,40 +197,15 @@ export default function GeneratePage() {
     }
   };
 
-  // ── From CSV/Excel file ──
-  const handleTemplateFile = useCallback((data: Record<string, unknown>[], _fileName: string) => {
-    const fields = fieldsFromData(data);
-    if (fields.length === 0) {
-      toast.error("No columns found in file.");
-      return;
-    }
-    setSuggestedFields(fields);
-    setShowFileUploader(false);
-    setShowCsvPaste(false);
-    toast.success(`${fields.length} fields extracted`);
-  }, []);
-
-  // ── From pasted CSV text ──
-  const extractFromPastedCsv = useCallback(() => {
-    if (!csvPasteText.trim()) return toast.error("Paste some CSV text first.");
-    const result = Papa.parse<Record<string, string>>(csvPasteText, { header: true, preview: 5, skipEmptyLines: true });
-    if (!result.meta.fields || result.meta.fields.length === 0) {
-      return toast.error("Could not detect column headers.");
-    }
-    const fields = fieldsFromData(result.data as Record<string, unknown>[]);
-    setSuggestedFields(fields);
-    setCsvPasteText("");
-    setShowCsvPaste(false);
-    toast.success(`${fields.length} fields extracted`);
-  }, [csvPasteText]);
-
   // ── Generate ──
   const generate = async (mode: RunMode) => {
     if (!activeModel) return toast.error("No model configured. Add an API key in Settings.");
-    if (!description.trim() && structure !== "define_columns") return toast.error("Describe the data you want to generate first.");
-    if (structure === "define_columns" && columns.some((c) => !c.name.trim())) return toast.error("All column names must be filled in.");
+    if (!description.trim() || !columns.some((c) => c.name.trim())) return toast.error("Cannot execute: Both a description and at least one schema column are required.");
+    if (columns.some((c) => c.name.trim()) && columns.some((c) => !c.name.trim())) return toast.error("All column names must be filled in.");
 
     const count = mode === "preview" ? 3 : mode === "test" ? 10 : rowCount;
+    // Auto-determine structure based on column definitions
+    const effectiveStructure = columns.some((c) => c.name.trim()) ? "define_columns" : "ai_decide";
 
     setRunId(null);
     setIsGenerating(true);
@@ -247,72 +213,30 @@ export default function GeneratePage() {
     setGeneratedData([]);
     setGeneratedRaw("");
 
-    let localRunId: string | null = null;
-    try {
-      if (isTauri) {
-        const rd = await createRun({
-          runType: "generate",
-          provider: activeModel.providerId,
-          model: activeModel.defaultModel,
-          temperature,
-          inputFile: "synthetic",
-          inputRows: count,
-        });
-        localRunId = rd.id ?? null;
-      } else {
-        const runRes = await fetch("/api/runs", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            runType: "generate",
-            provider: activeModel.providerId,
-            model: activeModel.defaultModel,
-            temperature,
-            inputFile: "synthetic",
-            inputRows: count,
-          }),
-        });
-        const rd = await runRes.json();
-        localRunId = rd.id ?? null;
-      }
-    } catch (err) {
-      console.warn("Run creation failed:", err);
-    }
+    const localRunId = await dispatchCreateRun({
+      runType: "generate",
+      provider: activeModel.providerId,
+      model: activeModel.defaultModel,
+      temperature,
+      inputFile: "synthetic",
+      inputRows: count,
+    });
 
     try {
-      let data: { rows: Row[]; rawCsv?: string; count?: number; raw?: string; error?: string };
-      if (isTauri) {
-        data = await generateRowDirect({
-          provider: activeModel.providerId,
-          model: activeModel.defaultModel,
-          apiKey: activeModel.apiKey || "",
-          baseUrl: activeModel.baseUrl,
-          rowCount: count,
-          columns: structure === "define_columns" ? columns : undefined,
-          freeformPrompt: description || undefined,
-          temperature,
-        });
-      } else {
-        const res = await fetch("/api/generate-row", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            provider: activeModel.providerId,
-            model: activeModel.defaultModel,
-            apiKey: activeModel.apiKey || "local",
-            baseUrl: activeModel.baseUrl,
-            rowCount: count,
-            columns: structure === "define_columns" ? columns : undefined,
-            freeformPrompt: description || undefined,
-            outputFormat,
-            temperature,
-          }),
-        });
-        data = await res.json();
-      }
-      if (data.error) throw new Error(data.error);
+      const data = await dispatchGenerateRow({
+        provider: activeModel.providerId,
+        model: activeModel.defaultModel,
+        apiKey: activeModel.apiKey || "",
+        baseUrl: activeModel.baseUrl,
+        rowCount: count,
+        columns: effectiveStructure === "define_columns" ? columns : undefined,
+        freeformPrompt: description || undefined,
+        outputFormat: outputFormat === "excel" ? "tabular" : outputFormat,
+        temperature,
+        systemPrompt: aiInstructions || undefined,
+      });
 
-      if (outputFormat === "tabular") {
+      if (outputFormat === "tabular" || outputFormat === "excel") {
         setGeneratedData(data.rows as Row[]);
       } else {
         setGeneratedRaw(typeof data.raw === "string" ? data.raw : JSON.stringify(data.rows, null, 2));
@@ -320,25 +244,13 @@ export default function GeneratePage() {
 
       // Save results to history
       if (localRunId) {
-        try {
-          const resultRows = (data.rows as Row[]).map((row, i) => ({
-            rowIndex: i,
-            input: row as Record<string, unknown>,
-            output: JSON.stringify(row),
-            status: "success" as const,
-          }));
-          if (isTauri) {
-            await saveResults(localRunId, resultRows);
-          } else {
-            await fetch("/api/results", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ runId: localRunId, results: resultRows }),
-            });
-          }
-        } catch (err) {
-          console.warn("Failed to save results to history:", err);
-        }
+        const resultRows = (data.rows as Row[]).map((row, i) => ({
+          rowIndex: i,
+          input: row as Record<string, unknown>,
+          output: JSON.stringify(row),
+          status: "success" as const,
+        }));
+        await dispatchSaveResults(localRunId, resultRows);
       }
 
       setRunId(localRunId);
@@ -349,6 +261,14 @@ export default function GeneratePage() {
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  const exportXlsx = () => {
+    if (generatedData.length === 0) return;
+    const ws = XLSX.utils.json_to_sheet(generatedData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Generated Data");
+    XLSX.writeFile(wb, `generated_data_${Date.now()}.xlsx`);
   };
 
   const exportCsv = () => {
@@ -373,10 +293,10 @@ export default function GeneratePage() {
   const hasSuggestions = suggestedFields.length > 0;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-0 pb-16">
+    <div className="space-y-0 pb-16">
 
       {/* ── Header ─────────────────────────────────────────────────────── */}
-      <div className="space-y-1 pb-6">
+      <div className="space-y-1 pb-6 max-w-3xl">
         <h1 className="text-4xl font-bold">Generate Data</h1>
         <p className="text-muted-foreground text-sm">
           Create synthetic datasets with AI-powered generation. Describe what you need and let AI build it for you.
@@ -385,7 +305,7 @@ export default function GeneratePage() {
 
       {/* ── 1. Describe Your Data ───────────────────────────────────────── */}
       <div className="space-y-3 pb-8">
-        <h2 className="text-2xl font-bold">1. Describe Your Data</h2>
+        <h2 className="text-2xl font-bold">1. Describe Data</h2>
         <div className="flex gap-3 items-start">
           <Textarea
             placeholder="Example: Generate realistic customer profiles including full names, email addresses, and purchase history..."
@@ -416,73 +336,42 @@ export default function GeneratePage() {
 
       <div className="border-t" />
 
-      {/* ── 2. Review Fields ─────────────────────────────────────────────── */}
-      {description.trim().length > 0 && (
-        <>
+      {/* ── 2. Define Columns ─────────────────────────────────────────────── */}
         <div className="space-y-4 py-8">
-          <h2 className="text-2xl font-bold">2. Review Fields</h2>
+          <h2 className="text-2xl font-bold">2. Define Columns</h2>
           <p className="text-sm text-muted-foreground -mt-2">
-            Get AI-suggested fields, extract from a file, or add manually. Checked fields define your schema.
+            Define your output columns using AI suggestions or manual entry.
           </p>
 
-          {/* Action buttons */}
-          <div className="flex gap-2 flex-wrap">
+          {/* Mode toggle */}
+          <div className="flex gap-2">
             <Button
-              variant="outline"
+              variant={suggestionMode === "ai" ? "default" : "outline"}
               size="sm"
               className="text-xs"
-              disabled={isSuggesting || !activeModel}
-              onClick={suggestFields}
+              onClick={() => { setSuggestionMode("ai"); suggestFields(); }}
             >
-              {isSuggesting ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5 mr-1.5" />}
-              Suggest with AI
+              <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+              AI Mode
             </Button>
             <Button
-              variant="outline"
+              variant={suggestionMode === "manual" ? "default" : "outline"}
               size="sm"
               className="text-xs"
-              onClick={() => { setShowFileUploader(!showFileUploader); setShowCsvPaste(false); }}
+              onClick={() => setSuggestionMode("manual")}
             >
-              <Upload className="h-3.5 w-3.5 mr-1.5" />
-              From CSV/Excel
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="text-xs"
-              onClick={() => { setShowCsvPaste(!showCsvPaste); setShowFileUploader(false); }}
-            >
-              <ClipboardPaste className="h-3.5 w-3.5 mr-1.5" />
-              Paste CSV
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              Manual Mode
             </Button>
           </div>
 
-          {/* File uploader (toggled) */}
-          {showFileUploader && (
-            <div className="max-w-md">
-              <FileUploader
-                onDataLoaded={handleTemplateFile}
-                accept={{
-                  "text/csv": [".csv"],
-                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
-                  "application/vnd.ms-excel": [".xls"],
-                }}
-              />
-            </div>
-          )}
-
-          {/* CSV paste area (toggled) */}
-          {showCsvPaste && (
-            <div className="space-y-2">
-              <Textarea
-                placeholder={"Paste CSV text here (with header row):\nname,age,city\nAlice,30,NYC\nBob,25,LA"}
-                className="min-h-[100px] text-xs font-mono resize-y"
-                value={csvPasteText}
-                onChange={(e) => setCsvPasteText(e.target.value)}
-              />
-              <Button size="sm" className="text-xs" onClick={extractFromPastedCsv}>
-                Extract Fields
-              </Button>
+          {/* AI mode content */}
+          {suggestionMode === "ai" && (
+          <>
+          {/* AI suggesting indicator */}
+          {isSuggesting && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Suggesting columns...
             </div>
           )}
 
@@ -562,211 +451,154 @@ export default function GeneratePage() {
               </div>
             </div>
           )}
+          </>
+          )}
+
+          {/* Manual mode content */}
+          {suggestionMode === "manual" && (
+            <div className="space-y-3">
+              <div className="border rounded-lg overflow-hidden">
+                <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium">Column Schema</div>
+                <div className="p-3 space-y-2">
+                  {columns.map((col, idx) => (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <Input
+                        placeholder="column_name"
+                        value={col.name}
+                        onChange={(e) => updateColumn(idx, { name: e.target.value })}
+                        className="flex-1 h-8 text-xs"
+                      />
+                      <Select
+                        value={col.type}
+                        onValueChange={(v) => updateColumn(idx, { type: v as GenerateColumn["type"] })}
+                      >
+                        <SelectTrigger className="w-28 h-8 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {COLUMN_TYPES.map((t) => (
+                            <SelectItem key={t} value={t} className="text-xs">{t}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        placeholder="Description (optional)"
+                        value={col.description || ""}
+                        onChange={(e) => updateColumn(idx, { description: e.target.value })}
+                        className="flex-1 h-8 text-xs text-muted-foreground"
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-muted-foreground hover:text-destructive shrink-0"
+                        onClick={() => removeColumn(idx)}
+                        disabled={columns.length === 1}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                <div className="px-3 pb-3">
+                  <Button variant="outline" size="sm" className="w-full text-xs" onClick={addColumn}>
+                    <Plus className="h-3 w-3 mr-2" /> Add Column
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="border-t" />
-        </>
-      )}
 
-      {/* ── 3. Configure Output ─────────────────────────────────────────── */}
-      <div className="space-y-0 py-8">
-      <h2 className="text-2xl font-bold mb-5">{description.trim().length > 0 ? "3" : "2"}. Configure Output</h2>
-      <div className="grid grid-cols-2 gap-8">
-        {/* Output Format */}
-        <div className="space-y-3">
-          <div className="font-semibold text-sm">Output Format</div>
-          <div className="space-y-2">
-            {([
-              { value: "tabular", label: "Tabular (CSV)", desc: "Structured rows and columns - best for spreadsheets and data analysis" },
-              { value: "json", label: "JSON", desc: "Nested structured data - best for APIs and complex relationships" },
-              { value: "freetext", label: "Free Text", desc: "Unstructured text output - best for qualitative data" },
-            ] as const).map(({ value, label, desc }) => (
-              <label key={value} className="flex items-start gap-2.5 cursor-pointer group">
-                <input
-                  type="radio"
-                  name="outputFormat"
-                  value={value}
-                  checked={outputFormat === value}
-                  onChange={() => setOutputFormat(value)}
-                  className="mt-0.5 accent-primary"
-                />
-                <div>
-                  <div className="text-sm font-medium leading-snug">{label}</div>
-                  {outputFormat === value && (
-                    <div className="text-xs text-muted-foreground mt-0.5">{desc}</div>
-                  )}
-                </div>
-              </label>
-            ))}
-          </div>
-        </div>
+      {/* ── 3. Configure Output (merged with Generation Settings) ──────── */}
+      <div className="py-8 space-y-5">
+        <h2 className="text-2xl font-bold">3. Configure Output</h2>
 
-        {/* Structure */}
-        <div className="space-y-3">
-          <div className="font-semibold text-sm">Structure</div>
-          <div className="space-y-2">
-            {([
-              { value: "ai_decide", label: "Let AI decide", desc: "AI determines the best schema based on your description" },
-              { value: "define_columns", label: "Define columns", desc: "Manually specify column names and types" },
-              { value: "use_template", label: "Use Template", desc: "Provide a row template for the AI to follow" },
-            ] as const).map(({ value, label, desc }) => (
-              <label key={value} className="flex items-start gap-2.5 cursor-pointer">
-                <input
-                  type="radio"
-                  name="structure"
-                  value={value}
-                  checked={structure === value}
-                  onChange={() => setStructure(value)}
-                  className="mt-0.5 accent-primary"
-                />
-                <div>
-                  <div className="text-sm font-medium leading-snug">{label}</div>
-                  {structure === value && (
-                    <div className="text-xs text-muted-foreground mt-0.5">{desc}</div>
-                  )}
-                </div>
-              </label>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      </div>{/* end Configure Output section */}
-
-      {/* Define columns builder (shown when define_columns AND no suggestions) */}
-      {structure === "define_columns" && !hasSuggestions && (
-        <div className="pb-4 space-y-3">
-          <div className="border rounded-lg overflow-hidden">
-            <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium">Column Schema</div>
-            <div className="p-3 space-y-2">
-              {columns.map((col, idx) => (
-                <div key={idx} className="flex gap-2 items-center">
-                  <Input
-                    placeholder="column_name"
-                    value={col.name}
-                    onChange={(e) => updateColumn(idx, { name: e.target.value })}
-                    className="flex-1 h-8 text-xs"
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+          {/* Output Format */}
+          <div className="space-y-3">
+            <div className="font-semibold text-sm">Output Format</div>
+            <div className="space-y-2">
+              {([
+                { value: "tabular", label: "Tabular (CSV)", desc: "Structured rows and columns - best for spreadsheets and data analysis" },
+                { value: "json", label: "JSON", desc: "Nested structured data - best for APIs and complex relationships" },
+                { value: "freetext", label: "Free Text", desc: "Unstructured text output - best for qualitative data" },
+                { value: "excel", label: "Excel (.xlsx)", desc: "Structured rows and columns exported as an Excel workbook" },
+              ] as const).map(({ value, label, desc }) => (
+                <label key={value} className="flex items-start gap-2.5 cursor-pointer group">
+                  <input
+                    type="radio"
+                    name="outputFormat"
+                    value={value}
+                    checked={outputFormat === value}
+                    onChange={() => setOutputFormat(value)}
+                    className="mt-0.5 accent-primary"
                   />
-                  <Select
-                    value={col.type}
-                    onValueChange={(v) => updateColumn(idx, { type: v as GenerateColumn["type"] })}
-                  >
-                    <SelectTrigger className="w-28 h-8 text-xs"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {COLUMN_TYPES.map((t) => (
-                        <SelectItem key={t} value={t} className="text-xs">{t}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Input
-                    placeholder="Description (optional)"
-                    value={col.description || ""}
-                    onChange={(e) => updateColumn(idx, { description: e.target.value })}
-                    className="flex-1 h-8 text-xs text-muted-foreground"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 text-muted-foreground hover:text-destructive shrink-0"
-                    onClick={() => removeColumn(idx)}
-                    disabled={columns.length === 1}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
+                  <div>
+                    <div className="text-sm font-medium leading-snug">{label}</div>
+                    {outputFormat === value && (
+                      <div className="text-xs text-muted-foreground mt-0.5">{desc}</div>
+                    )}
+                  </div>
+                </label>
               ))}
             </div>
-            <div className="px-3 pb-3">
-              <Button variant="outline" size="sm" className="w-full text-xs" onClick={addColumn}>
-                <Plus className="h-3 w-3 mr-2" /> Add Column
-              </Button>
-            </div>
           </div>
-        </div>
-      )}
 
-      {/* Use Template textarea */}
-      {structure === "use_template" && (
-        <div className="pb-6 space-y-2">
-          <Label className="text-sm font-medium">Row Template</Label>
-          <Textarea
-            placeholder={`Provide an example row for the AI to follow:\n\n{"name": "John Smith", "age": 34, "feedback": "Great product!", "rating": 5}`}
-            className="min-h-[120px] text-xs font-mono resize-y"
-            value={templateText}
-            onChange={(e) => setTemplateText(e.target.value)}
-          />
-          <p className="text-[11px] text-muted-foreground">The AI will generate rows that follow this structure and style.</p>
-        </div>
-      )}
+          {/* Rows + Variation */}
+          <div className="space-y-5">
+            {/* Row count */}
+            <div className="space-y-2">
+              <Label className="text-sm text-muted-foreground">Rows to Generate</Label>
+              <div className="flex items-center border rounded-lg overflow-hidden">
+                <button
+                  className="px-4 py-2.5 hover:bg-muted text-sm border-r transition-colors"
+                  onClick={() => setRowCount((n) => Math.max(1, n - 10))}
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                </button>
+                <Input
+                  type="number"
+                  min={1}
+                  max={500}
+                  value={rowCount}
+                  onChange={(e) => setRowCount(Math.min(500, Math.max(1, parseInt(e.target.value) || 1)))}
+                  className="flex-1 border-none h-10 text-center text-sm focus-visible:ring-0 rounded-none"
+                />
+                <button
+                  className="px-4 py-2.5 hover:bg-muted text-sm border-l transition-colors"
+                  onClick={() => setRowCount((n) => Math.min(500, n + 10))}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
 
-      <div className="border-t" />
-
-      {/* ── 4. Generation Settings ──────────────────────────────────────── */}
-      <div className="py-8 space-y-5">
-        <h2 className="text-2xl font-bold">{description.trim().length > 0 ? "4" : "3"}. Generation Settings</h2>
-
-        <div className="grid grid-cols-2 gap-8">
-          {/* Row count */}
-          <div className="space-y-2">
-            <Label className="text-sm text-muted-foreground">Rows to Generate</Label>
-            <div className="flex items-center border rounded-lg overflow-hidden">
-              <button
-                className="px-4 py-2.5 hover:bg-muted text-sm border-r transition-colors"
-                onClick={() => setRowCount((n) => Math.max(1, n - 10))}
-              >
-                <Minus className="h-3.5 w-3.5" />
-              </button>
-              <Input
-                type="number"
-                min={1}
-                max={500}
-                value={rowCount}
-                onChange={(e) => setRowCount(Math.min(500, Math.max(1, parseInt(e.target.value) || 1)))}
-                className="flex-1 border-none h-10 text-center text-sm focus-visible:ring-0 rounded-none"
+            {/* Variation level */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label className="text-sm text-muted-foreground">Variation Level</Label>
+                <span className="text-sm font-semibold text-primary">{VARIATION_LEVELS[variationIdx].label}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={VARIATION_LEVELS.length - 1}
+                step={1}
+                value={variationIdx}
+                onChange={(e) => setVariationIdx(parseInt(e.target.value))}
+                className="w-full accent-primary"
               />
-              <button
-                className="px-4 py-2.5 hover:bg-muted text-sm border-l transition-colors"
-                onClick={() => setRowCount((n) => Math.min(500, n + 10))}
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-
-          {/* Variation level */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label className="text-sm text-muted-foreground">Variation Level</Label>
-              <span className="text-sm font-semibold text-primary">{VARIATION_LEVELS[variationIdx].label}</span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={VARIATION_LEVELS.length - 1}
-              step={1}
-              value={variationIdx}
-              onChange={(e) => setVariationIdx(parseInt(e.target.value))}
-              className="w-full accent-primary"
-            />
-            <div className="flex justify-between text-[11px] text-muted-foreground">
-              <span>Low</span>
-              <span>Maximum</span>
+              <div className="flex justify-between text-[11px] text-muted-foreground">
+                <span>Low</span>
+                <span>Maximum</span>
+              </div>
             </div>
           </div>
         </div>
 
         {/* Info / warning box */}
-        {!canGenerate ? (
-          <div className="px-4 py-3 rounded-lg bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 text-sm text-blue-700 dark:text-blue-300">
-            Describe the data you want to generate to get started.
-          </div>
-        ) : !activeModel ? (
-          <Link href="/settings">
-            <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 cursor-pointer hover:opacity-90 text-sm text-amber-700">
-              <AlertCircle className="h-4 w-4 shrink-0" />
-              No AI model configured — click here to add an API key in Settings
-            </div>
-          </Link>
+        {!canGenerate ? null : !activeModel ? (
+          <NoModelWarning activeModel={activeModel} />
         ) : (
           <div className="px-4 py-3 rounded-lg bg-muted/30 border text-xs text-muted-foreground">
             Ready to generate {rowCount} rows using <strong>{activeModel.providerId} / {activeModel.defaultModel}</strong>
@@ -777,9 +609,18 @@ export default function GeneratePage() {
 
       <div className="border-t" />
 
+      {/* ── 4. AI Instructions ─────────────────────────────────────────── */}
+      <AIInstructionsSection
+        sectionNumber={4}
+        value={aiInstructions}
+        onChange={setAiInstructions}
+      />
+
+      <div className="border-t" />
+
       {/* ── 5. Execute ──────────────────────────────────────────────────── */}
       <div className="space-y-4 py-8">
-        <h2 className="text-2xl font-bold">{description.trim().length > 0 ? "5" : "4"}. Execute</h2>
+        <h2 className="text-2xl font-bold">5. Execute</h2>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Button
             variant="outline"
@@ -832,7 +673,12 @@ export default function GeneratePage() {
                   View in History
                 </Link>
               )}
-              {generatedData.length > 0 && (
+              {generatedData.length > 0 && outputFormat === "excel" && (
+                <Button variant="outline" size="sm" onClick={exportXlsx}>
+                  <Download className="h-3.5 w-3.5 mr-1.5" /> Export XLSX
+                </Button>
+              )}
+              {generatedData.length > 0 && outputFormat !== "excel" && (
                 <Button variant="outline" size="sm" onClick={exportCsv}>
                   <Download className="h-3.5 w-3.5 mr-1.5" /> Export CSV
                 </Button>
@@ -853,7 +699,7 @@ export default function GeneratePage() {
 
           {generatedData.length > 0 ? (
             <div className="border rounded-lg overflow-hidden">
-              <DataTable data={generatedData} />
+              <DataTable data={generatedData} showAll />
             </div>
           ) : (
             <div className="border rounded-lg overflow-hidden">

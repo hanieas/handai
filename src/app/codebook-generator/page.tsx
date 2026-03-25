@@ -1,22 +1,25 @@
 "use client";
 
-import React, { useState } from "react";
-import { FileUploader } from "@/components/tools/FileUploader";
-import { DataTable } from "@/components/tools/DataTable";
-import { SampleDatasetPicker } from "@/components/tools/SampleDatasetPicker";
+import React, { useState, useCallback } from "react";
+import { UploadPreview } from "@/components/tools/UploadPreview";
+import { ColumnSelector } from "@/components/tools/ColumnSelector";
+import { NoModelWarning } from "@/components/tools/NoModelWarning";
+import { AIInstructionsSection } from "@/components/tools/AIInstructionsSection";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { SAMPLE_DATASETS } from "@/lib/sample-data";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useActiveModel, useSystemSettings } from "@/lib/hooks";
+import { useAIInstructions, AI_INSTRUCTIONS_MARKER } from "@/hooks/useAIInstructions";
+import { useColumnSelection } from "@/hooks/useColumnSelection";
 import { getPrompt } from "@/lib/prompts";
-import { Download, Loader2, CheckCircle2, AlertCircle, Copy, X } from "lucide-react";
+import { SAMPLE_DATASETS } from "@/lib/sample-data";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Download, Loader2, CheckCircle2, ChevronDown, X } from "lucide-react";
+import XLSX from "xlsx";
 import { toast } from "sonner";
-import Link from "next/link";
 import type { Row } from "@/types";
-import { processRowDirect } from "@/lib/llm-browser";
-import { createRun, saveResults } from "@/lib/db-tauri";
-
-const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+import { dispatchProcessRow, dispatchCreateRun, dispatchSaveResults } from "@/lib/llm-dispatch";
 
 type Stage = "idle" | "discovery" | "consolidation" | "definition" | "done";
 
@@ -28,6 +31,13 @@ const STAGE_LABELS: Record<Stage, string> = {
   done: "Complete",
 };
 
+const SAMPLE_CODEBOOK_DESCRIPTIONS: Record<string, string> = {
+  "Sentiment analysis": "Generate a codebook for sentiment analysis: positive, negative, neutral, and mixed sentiments with clear definitions",
+  "Thematic coding (interviews)": "Create a thematic codebook for qualitative interview data, identifying recurring themes and patterns",
+  "Customer feedback categories": "Build a codebook to categorize customer feedback into actionable categories like complaints, suggestions, praise, and questions",
+  "Content classification": "Design a codebook for classifying text content by topic, tone, and intent",
+};
+
 interface RawTheme {
   theme: string;
   description: string;
@@ -36,47 +46,79 @@ interface RawTheme {
 
 interface CodeEntry {
   code: string;
-  definition: string;
-  inclusion: string;
-  exclusion: string;
-  examples: string[];
+  description: string;
+  example: string;
 }
 
 function cleanJson(raw: string): string {
   return raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 }
 
-function toMarkdown(entries: CodeEntry[]): string {
-  return entries
-    .map(
-      (e) =>
-        `## ${e.code}\n**Definition:** ${e.definition}\n**Include when:** ${e.inclusion}\n**Exclude when:** ${e.exclusion}\n**Examples:**\n${(e.examples || []).map((ex) => `- ${ex}`).join("\n")}`
-    )
-    .join("\n\n");
+function cleanCodeName(raw: string): string {
+  let s = raw.trim();
+  s = s.replace(/_/g, " ");
+  s = s.replace(/([a-z])([A-Z])/g, "$1 $2");
+  if (s === s.toUpperCase() && s.length > 1) {
+    s = s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return s;
 }
 
 export default function CodebookGeneratorPage() {
   const [data, setData] = useState<Row[]>([]);
   const [dataName, setDataName] = useState("");
+  const [codebookDescription, setCodebookDescription] = useState("");
   const [stage, setStage] = useState<Stage>("idle");
-  const [codebook, setCodebook] = useState("");
   const [codebookStructured, setCodebookStructured] = useState<CodeEntry[]>([]);
-  const [copied, setCopied] = useState(false);
-  const [useAllRows, setUseAllRows] = useState(false);
 
-  // Phase A / B split state (Improvement 5a)
+  // Phase A / B split state
   const [discoveryThemes, setDiscoveryThemes] = useState<RawTheme[]>([]);
   const [discoveryRaw, setDiscoveryRaw] = useState("");
   const [awaitingReview, setAwaitingReview] = useState(false);
-  const [phaseAQuickMode, setPhaseAQuickMode] = useState(false);
 
   const providerConfig = useActiveModel();
   const systemSettings = useSystemSettings();
 
+  const allColumns = data.length > 0 ? Object.keys(data[0]) : [];
+  const { selectedCols, setSelectedCols, toggleCol, toggleAll } = useColumnSelection(allColumns, false);
+
+  // ── Auto-generate AI Instructions ──
+  const buildAutoInstructions = useCallback(() => {
+    const lines: string[] = [];
+    lines.push("You are a qualitative researcher generating a codebook from data.");
+    lines.push("");
+
+    if (codebookDescription.trim()) {
+      lines.push("CODEBOOK DESCRIPTION:");
+      lines.push(codebookDescription.trim());
+      lines.push("");
+    }
+
+    if (selectedCols.length > 0) {
+      lines.push("SELECTED COLUMNS:");
+      selectedCols.forEach((c) => lines.push(`- ${c}`));
+      lines.push("");
+    }
+
+    lines.push("RULES:");
+    lines.push("- Analyze the data and identify distinct codes/themes");
+    lines.push("- For each code provide: code label, description, and representative example");
+    lines.push("- Return a JSON array of objects with keys: code, description, example");
+    lines.push("- Codes should be mutually exclusive and collectively exhaustive");
+    lines.push("- IMPORTANT: Code names MUST be natural human-readable phrases (e.g. \"Emotional Response\", \"Social Support\"), NEVER abbreviations, acronyms, underscores, or codes like \"EMOT_RESP\" or \"SOC_SUPP\"");
+    lines.push("- Do not include markdown, code fences, or commentary");
+    lines.push("");
+    lines.push(AI_INSTRUCTIONS_MARKER);
+
+    return lines.join("\n");
+  }, [codebookDescription, selectedCols]);
+
+  // AI Instructions
+  const [aiInstructions, setAiInstructions] = useAIInstructions(buildAutoInstructions);
+
   const handleDataLoaded = (loaded: Row[], name: string) => {
     setData(loaded);
     setDataName(name);
-    setCodebook("");
     setCodebookStructured([]);
     setStage("idle");
     setDiscoveryThemes([]);
@@ -85,63 +127,52 @@ export default function CodebookGeneratorPage() {
     toast.success(`Loaded ${loaded.length} rows`);
   };
 
-  const loadSample = (key: string) => {
-    const s = SAMPLE_DATASETS[key];
-    if (s) handleDataLoaded(s.data, s.name);
+  const handleLoadSample = (key: string) => {
+    const ds = SAMPLE_DATASETS[key];
+    if (ds) handleDataLoaded(ds.data as Row[], ds.name);
   };
 
   const callLLM = async (systemPrompt: string, userContent: string): Promise<string> => {
     if (!providerConfig) throw new Error("No enabled provider with API key found");
-    let result: { output?: string; error?: string };
-    if (isTauri) {
-      result = await processRowDirect({
-        provider: providerConfig.providerId,
-        model: providerConfig.defaultModel,
-        apiKey: providerConfig.apiKey || "",
-        baseUrl: providerConfig.baseUrl,
-        systemPrompt,
-        userContent,
-        temperature: systemSettings.temperature || 0.3,
-      });
-    } else {
-      const res = await fetch("/api/process-row", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: providerConfig.providerId,
-          model: providerConfig.defaultModel,
-          apiKey: providerConfig.apiKey || "local",
-          baseUrl: providerConfig.baseUrl,
-          systemPrompt,
-          userContent,
-          temperature: systemSettings.temperature || 0.3,
-        }),
-      });
-      if (!res.ok) throw new Error(`Server error ${res.status}`);
-      result = await res.json();
-    }
-    if (result.error) throw new Error(result.error);
-    return result.output as string;
+    const { output } = await dispatchProcessRow({
+      provider: providerConfig.providerId,
+      model: providerConfig.defaultModel,
+      apiKey: providerConfig.apiKey || "",
+      baseUrl: providerConfig.baseUrl,
+      systemPrompt,
+      userContent,
+      temperature: systemSettings.temperature || 0.3,
+    });
+    return output;
   };
 
   // Phase A: run Stage 1 discovery only, then pause for review
-  const generatePhaseA = async (quickMode: boolean) => {
+  const generatePhaseA = async () => {
     if (data.length === 0) return toast.error("No data loaded");
     if (!providerConfig) return toast.error("No enabled provider configured. Check Settings.");
 
-    setPhaseAQuickMode(quickMode);
-    setUseAllRows(!quickMode);
-    const sampleRows = quickMode ? data.slice(0, 30) : data.slice(0, 100);
+    const sampleRows = data.slice(0, 100);
+
+    // Filter to selected columns only
+    const filteredRows = selectedCols.length > 0
+      ? sampleRows.map((row) => Object.fromEntries(selectedCols.map((c) => [c, row[c]])))
+      : sampleRows;
 
     try {
       setStage("discovery");
       const discoveryOutput = await callLLM(
-        getPrompt("codebook.discovery"),
-        `Analyze these ${sampleRows.length} data samples:\n\n${JSON.stringify(sampleRows, null, 2)}`
+        aiInstructions || getPrompt("codebook.discovery"),
+        `Analyze these ${filteredRows.length} data samples:\n\n${JSON.stringify(filteredRows, null, 2)}`
       );
 
       try {
-        const themes = JSON.parse(cleanJson(discoveryOutput)) as RawTheme[];
+        const raw = JSON.parse(cleanJson(discoveryOutput)) as Record<string, unknown>[];
+        const themes: RawTheme[] = raw.map((r) => ({
+          theme: cleanCodeName(String(r.theme ?? r.code ?? r.name ?? "")),
+          description: String(r.description ?? r.definition ?? ""),
+          examples: Array.isArray(r.examples) ? r.examples as string[]
+            : r.example ? [String(r.example)] : [],
+        }));
         setDiscoveryThemes(themes);
         setDiscoveryRaw("");
       } catch {
@@ -173,54 +204,50 @@ export default function CodebookGeneratorPage() {
         `Consolidate these raw themes:\n\n${themesJson}`
       );
 
-      // Stage 3: Definition (returns JSON per codebook.definition prompt)
+      // Stage 3: Definition — ask for 3-field format
       setStage("definition");
       const definitionOutput = await callLLM(
-        getPrompt("codebook.definition"),
+        `You are a qualitative researcher creating a formal codebook. Return a JSON array of objects, each with exactly these keys: "code" (short label), "description" (clear definition), "example" (a representative example from the data). Do not include any other keys. Do not include markdown or code fences.`,
         `Create formal definitions for these consolidated themes:\n\n${consolidationOutput}`
       );
 
       let structured: CodeEntry[] = [];
-      let mdText = "";
       try {
-        structured = JSON.parse(cleanJson(definitionOutput)) as CodeEntry[];
-        mdText = toMarkdown(structured);
+        const parsed = JSON.parse(cleanJson(definitionOutput));
+        // Normalize to CodeEntry shape (handle legacy formats)
+        structured = (parsed as Record<string, unknown>[]).map((e) => ({
+          code: cleanCodeName(String(e.code ?? e.theme ?? "")),
+          description: String(e.description ?? e.definition ?? ""),
+          example: String(e.example ?? (Array.isArray(e.examples) ? (e.examples as string[])[0] ?? "" : "") ?? ""),
+        }));
       } catch {
-        // Fallback: treat output as raw markdown
-        mdText = definitionOutput;
+        // Could not parse — leave empty
       }
 
       setCodebookStructured(structured);
-      setCodebook(mdText);
       setStage("done");
       toast.success("Codebook generated (3 stages complete)!");
 
       // Save to history DB
       try {
-        const runParams = { runType: "codebook-generator", provider: providerConfig.providerId, model: providerConfig.defaultModel, temperature: systemSettings.temperature || 0.3, systemPrompt: "3-stage codebook pipeline", inputFile: dataName || "unnamed", inputRows: data.length };
-        let runId: string | null = null;
-        if (isTauri) {
-          const rd = await createRun(runParams);
-          runId = rd.id ?? null;
-        } else {
-          const res = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(runParams) });
-          if (!res.ok) throw new Error(`Server error ${res.status}`);
-          const rd = await res.json();
-          runId = rd.id ?? null;
-        }
+        const runId = await dispatchCreateRun({
+          runType: "codebook-generator",
+          provider: providerConfig.providerId,
+          model: providerConfig.defaultModel,
+          temperature: systemSettings.temperature || 0.3,
+          systemPrompt: "3-stage codebook pipeline",
+          inputFile: dataName || "unnamed",
+          inputRows: data.length,
+        });
         if (runId) {
-          const resultRows = (structured.length > 0 ? structured : [{ raw: mdText }]).map((entry, i) => ({
+          const resultRows = structured.map((entry, i) => ({
             rowIndex: i,
             input: { stage: "codebook" } as Record<string, unknown>,
             output: JSON.stringify(entry),
             status: "success" as const,
             latency: 0,
           }));
-          if (isTauri) {
-            await saveResults(runId, resultRows);
-          } else {
-            await fetch("/api/results", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, results: resultRows }) });
-          }
+          await dispatchSaveResults(runId, resultRows);
         }
       } catch (err) { console.warn("Failed to save codebook to history:", err); }
     } catch (err: unknown) {
@@ -237,26 +264,35 @@ export default function CodebookGeneratorPage() {
     setStage("idle");
   };
 
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(codebook);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-    toast.success("Copied to clipboard");
-  };
-
-  const exportMarkdown = () => {
-    if (!codebook) return;
-    const blob = new Blob([codebook], { type: "text/markdown" });
+  const exportCsv = () => {
+    if (codebookStructured.length === 0) return;
+    const headers = ["Code", "Description", "Example"];
+    const csv = [
+      headers.join(","),
+      ...codebookStructured.map((e) =>
+        [e.code, e.description, e.example].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")
+      ),
+    ].join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `codebook_${dataName || Date.now()}.md`;
+    a.download = `codebook_${dataName || Date.now()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  const exportXlsx = () => {
+    if (codebookStructured.length === 0) return;
+    const rows = codebookStructured.map((e) => ({ Code: e.code, Description: e.description, Example: e.example }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Codebook");
+    XLSX.writeFile(wb, `codebook_${dataName || Date.now()}.xlsx`);
+  };
+
   const exportJson = () => {
-    if (!codebookStructured.length) return;
+    if (codebookStructured.length === 0) return;
     const blob = new Blob([JSON.stringify(codebookStructured, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -270,10 +306,10 @@ export default function CodebookGeneratorPage() {
   const stageOrder: Stage[] = ["discovery", "consolidation", "definition"];
 
   return (
-    <div className="max-w-4xl mx-auto space-y-0 pb-16">
+    <div className="space-y-0 pb-16">
 
       {/* Header */}
-      <div className="pb-6 space-y-1">
+      <div className="pb-6 space-y-1 max-w-3xl">
         <h1 className="text-4xl font-bold">Codebook Generator</h1>
         <p className="text-muted-foreground text-sm">3-stage AI pipeline: Discovery → Consolidation → Definition</p>
       </div>
@@ -281,34 +317,82 @@ export default function CodebookGeneratorPage() {
       {/* ── 1. Upload Data ────────────────────────────────────────────────── */}
       <div className="space-y-4 pb-8">
         <h2 className="text-2xl font-bold">1. Upload Data</h2>
-        <FileUploader onDataLoaded={handleDataLoaded} />
-        <SampleDatasetPicker onSelect={loadSample} />
-
-        {data.length > 0 && (
-          <>
-            <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-green-50 dark:bg-green-950/20 border border-green-200 text-sm text-green-700 dark:text-green-300">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              <span>
-                <strong>{data.length} rows</strong> loaded from <strong>{dataName}</strong>
-                <span className="text-xs text-green-600 ml-2">(Quick: first 30 rows · Full: up to 100 rows)</span>
-              </span>
-            </div>
-            <div className="border rounded-lg overflow-hidden">
-              <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium flex justify-between items-center">
-                <span>Data Preview</span>
-                <span className="text-xs text-muted-foreground font-normal">first 5 of {data.length} rows</span>
-              </div>
-              <DataTable data={data} maxRows={5} />
-            </div>
-          </>
-        )}
+        <UploadPreview
+          data={data}
+          dataName={dataName}
+          onDataLoaded={handleDataLoaded}
+          samplePickerPosition="above"
+          customSamplePicker={
+            <Select onValueChange={handleLoadSample}>
+              <SelectTrigger className="w-[200px] h-9 text-xs">
+                <SelectValue placeholder="-- Select a sample..." />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.keys(SAMPLE_DATASETS).map((key) => (
+                  <SelectItem key={key} value={key} className="text-xs">
+                    {SAMPLE_DATASETS[key].name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+          bannerExtra={
+            <span className="text-xs text-green-600 ml-2">(up to 100 rows sampled)</span>
+          }
+        />
       </div>
 
       <div className="border-t" />
 
-      {/* ── 2. Generate ───────────────────────────────────────────────────── */}
+      {/* ── 2. Describe Codebook ──────────────────────────────────────────── */}
       <div className="space-y-4 py-8">
-        <h2 className="text-2xl font-bold">2. Generate Codebook</h2>
+        <h2 className="text-2xl font-bold">2. Describe Codebook</h2>
+        <div className="flex gap-3 items-start">
+          <Textarea
+            placeholder="Example: Generate a codebook for thematic analysis of interview transcripts about workplace satisfaction..."
+            className="flex-1 min-h-[100px] text-sm resize-y"
+            value={codebookDescription}
+            onChange={(e) => setCodebookDescription(e.target.value)}
+          />
+          <div className="shrink-0">
+            <Select
+              onValueChange={(key) => {
+                if (SAMPLE_CODEBOOK_DESCRIPTIONS[key]) {
+                  setCodebookDescription(SAMPLE_CODEBOOK_DESCRIPTIONS[key]);
+                }
+              }}
+            >
+              <SelectTrigger className="w-[200px] h-9 text-xs">
+                <SelectValue placeholder="-- Select a sample..." />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.keys(SAMPLE_CODEBOOK_DESCRIPTIONS).map((key) => (
+                  <SelectItem key={key} value={key} className="text-xs">{key}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <ColumnSelector
+          allColumns={allColumns}
+          selectedCols={selectedCols}
+          onToggleCol={toggleCol}
+          onToggleAll={toggleAll}
+          description="Choose which columns the AI should analyze to generate the codebook."
+        />
+      </div>
+
+      <div className="border-t" />
+
+      {/* ── 3. AI Instructions ────────────────────────────────────────────── */}
+      <AIInstructionsSection sectionNumber={3} value={aiInstructions} onChange={setAiInstructions} />
+
+      <div className="border-t" />
+
+      {/* ── 4. Execute ────────────────────────────────────────────────────── */}
+      <div className="space-y-4 py-8">
+        <h2 className="text-2xl font-bold">4. Execute</h2>
 
         {/* Stage progress tracker */}
         {stage !== "idle" && (
@@ -336,30 +420,15 @@ export default function CodebookGeneratorPage() {
           </div>
         )}
 
-        {!providerConfig && (
-          <Link href="/settings">
-            <div className="flex items-center gap-3 px-4 py-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 cursor-pointer hover:opacity-90 text-sm text-amber-700">
-              <AlertCircle className="h-4 w-4 shrink-0" />
-              No AI model configured — click here to add an API key in Settings
-            </div>
-          </Link>
-        )}
+        <NoModelWarning activeModel={providerConfig} />
 
         {!awaitingReview && (
-          <div className="grid grid-cols-2 gap-4">
-            <Button size="lg" className="h-12 text-base bg-red-500 hover:bg-red-600 text-white"
-              disabled={data.length === 0 || isProcessing || !providerConfig || awaitingReview}
-              onClick={() => generatePhaseA(true)}>
-              {isProcessing && !useAllRows ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-              Quick (30 rows)
-            </Button>
-            <Button variant="outline" size="lg" className="h-12 text-base"
-              disabled={data.length === 0 || isProcessing || !providerConfig || awaitingReview}
-              onClick={() => generatePhaseA(false)}>
-              {isProcessing && useAllRows ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-              Full ({Math.min(data.length, 100)} rows)
-            </Button>
-          </div>
+          <Button size="lg" className="h-12 text-base bg-red-500 hover:bg-red-600 text-white w-full"
+            disabled={data.length === 0 || isProcessing || !providerConfig || awaitingReview}
+            onClick={() => generatePhaseA()}>
+            {isProcessing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+            Run ({Math.min(data.length, 100)} rows)
+          </Button>
         )}
 
         {isProcessing && (
@@ -432,41 +501,48 @@ export default function CodebookGeneratorPage() {
       )}
 
       {/* ── Results ────────────────────────────────────────────────────────── */}
-      {codebook && (
+      {codebookStructured.length > 0 && (
         <div className="space-y-4 border-t pt-6 pb-8">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-lg font-semibold">Generated Codebook</h2>
+              <h2 className="text-lg font-semibold">Results</h2>
               <p className="text-xs text-muted-foreground mt-0.5">
-                {codebook.split("\n").length} lines · {(codebook.length / 1000).toFixed(1)}KB
-                {codebookStructured.length > 0 && ` · ${codebookStructured.length} codes`}
+                {codebookStructured.length} codes generated
               </p>
             </div>
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={copyToClipboard}>
-                {copied ? <CheckCircle2 className="h-3.5 w-3.5 mr-1.5 text-green-500" /> : <Copy className="h-3.5 w-3.5 mr-1.5" />}
-                {copied ? "Copied!" : "Copy"}
-              </Button>
-              <Button variant="outline" size="sm" onClick={exportMarkdown}>
-                <Download className="h-3.5 w-3.5 mr-1.5" /> Export MD
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={exportJson}
-                disabled={codebookStructured.length === 0}
-                title={codebookStructured.length === 0 ? "JSON not available (Stage 3 output could not be parsed)" : undefined}
-              >
-                <Download className="h-3.5 w-3.5 mr-1.5" /> Export JSON
-              </Button>
-            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <Download className="h-3.5 w-3.5 mr-1.5" /> Export <ChevronDown className="h-3 w-3 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem onClick={exportCsv}>CSV</DropdownMenuItem>
+                <DropdownMenuItem onClick={exportXlsx}>Excel (.xlsx)</DropdownMenuItem>
+                <DropdownMenuItem onClick={exportJson}>JSON</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
 
-          <div className="border rounded-lg bg-muted/5 overflow-hidden">
-            <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium">Codebook — Markdown format</div>
-            <div className="p-4 overflow-y-auto max-h-[600px]">
-              <pre className="text-xs font-mono whitespace-pre-wrap leading-relaxed">{codebook}</pre>
-            </div>
+          <div className="border rounded-lg overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-muted/20 border-b">
+                  <th className="text-left px-4 py-2.5 font-medium">Code</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Description</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Example</th>
+                </tr>
+              </thead>
+              <tbody>
+                {codebookStructured.map((entry, idx) => (
+                  <tr key={idx} className="border-b last:border-b-0 hover:bg-muted/5">
+                    <td className="px-4 py-2.5 font-medium text-xs">{entry.code}</td>
+                    <td className="px-4 py-2.5 text-xs text-muted-foreground">{entry.description}</td>
+                    <td className="px-4 py-2.5 text-xs text-muted-foreground italic">{entry.example}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}

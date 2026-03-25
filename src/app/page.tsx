@@ -1,8 +1,8 @@
 "use client";
 
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Bot, Database, Edit3, Users, Wand2, Columns, History, BookOpen, Sparkles, FileArchive, ArrowRight, MoreVertical, Printer, Video, RefreshCw, Settings, Clock } from "lucide-react";
 import Link from "next/link";
-import { toast } from "sonner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -116,17 +116,69 @@ const CATEGORIES = [
         bg: "bg-slate-50 dark:bg-slate-900/30",
         border: "hover:border-slate-300 dark:hover:border-slate-600",
       },
+      {
+        title: "Settings",
+        description: "Manage API keys, providers, and system preferences.",
+        icon: Settings,
+        href: "/settings",
+        color: "text-slate-500",
+        bg: "bg-slate-50 dark:bg-slate-900/30",
+        border: "hover:border-slate-300 dark:hover:border-slate-600",
+      },
     ],
   },
 ];
 
 export default function HomePage() {
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  const toggleScreencast = useCallback(async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9"
+        : "video/webm";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      chunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `handai_screencast_${Date.now()}.webm`;
+        a.click();
+        URL.revokeObjectURL(url);
+        stream.getTracks().forEach((t) => t.stop());
+        setIsRecording(false);
+      };
+      stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        recorder.stop();
+      });
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+    } catch {
+      // User cancelled display picker
+    }
+  }, [isRecording]);
+
+  useEffect(() => {
+    return () => { mediaRecorderRef.current?.stop(); };
+  }, []);
+
   return (
-    <div className="max-w-5xl mx-auto space-y-10 pb-16 animate-in fade-in duration-500">
+    <div className="space-y-10 pb-16 animate-in fade-in duration-500">
 
       {/* Hero */}
       <div className="space-y-2 pb-2 flex items-start justify-between">
-        <div>
+        <div className="max-w-3xl">
           <h1 className="text-4xl font-bold tracking-tight">Welcome to Handai</h1>
           <p className="text-lg text-muted-foreground">
             Your AI-powered qualitative research and data science suite.
@@ -134,8 +186,11 @@ export default function HomePage() {
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" className="shrink-0 mt-1">
+            <Button variant="ghost" size="icon" className="shrink-0 mt-1 relative">
               <MoreVertical className="h-5 w-5" />
+              {isRecording && (
+                <span className="absolute top-0.5 right-0.5 h-2.5 w-2.5 rounded-full bg-red-500 animate-pulse" />
+              )}
               <span className="sr-only">Actions</span>
             </Button>
           </DropdownMenuTrigger>
@@ -144,9 +199,9 @@ export default function HomePage() {
               <Printer className="h-4 w-4" />
               Print Page
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => toast.info("Coming soon")}>
+            <DropdownMenuItem onClick={toggleScreencast}>
               <Video className="h-4 w-4" />
-              Screencast
+              {isRecording ? "Stop Recording" : "Screencast"}
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => window.location.reload()}>
               <RefreshCw className="h-4 w-4" />

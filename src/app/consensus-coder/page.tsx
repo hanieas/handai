@@ -1,48 +1,46 @@
 "use client";
 
-import React, { useState, useRef } from "react";
-import { FileUploader } from "@/components/tools/FileUploader";
-import { DataTable } from "@/components/tools/DataTable";
-import { SampleDatasetPicker } from "@/components/tools/SampleDatasetPicker";
+import React, { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { SAMPLE_DATASETS } from "@/lib/sample-data";
 import { useAppStore } from "@/lib/store";
 import { useSystemSettings } from "@/lib/hooks";
-import { downloadCSV } from "@/lib/export";
-import { Download, Loader2, CheckCircle2, ChevronDown, ChevronRight, HelpCircle, ExternalLink } from "lucide-react";
+import { Loader2, ChevronDown, ChevronRight, HelpCircle, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 import pLimit from "p-limit";
 import Link from "next/link";
 import type { Row } from "@/types";
-import { consensusRowDirect } from "@/lib/llm-browser";
-import { createRun, saveResults } from "@/lib/db-tauri";
-
-const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+import { dispatchCreateRun, dispatchSaveResults, dispatchConsensusRow } from "@/lib/llm-dispatch";
+import { UploadPreview } from "@/components/tools/UploadPreview";
+import { ColumnSelector } from "@/components/tools/ColumnSelector";
+import { useColumnSelection } from "@/hooks/useColumnSelection";
+import { DataTable } from "@/components/tools/DataTable";
+import { SAMPLE_DATASETS } from "@/lib/sample-data";
+import { AIInstructionsSection } from "@/components/tools/AIInstructionsSection";
+import { useAIInstructions, AI_INSTRUCTIONS_MARKER } from "@/hooks/useAIInstructions";
 
 type RunMode = "preview" | "test" | "full";
 
-const DEFAULT_WORKER_PROMPT = `Analyze the provided data and respond with ONLY the requested output values.
+const DEFAULT_WORKER_PROMPT = `Apply the given instructions to the data. Return ONLY the requested values.
 
-CRITICAL FORMAT REQUIREMENTS:
-- Output MUST be in strict CSV format (comma-separated values)
-- NO explanations, NO prose, NO markdown, NO code blocks
-- NO headers or labels - just the raw values
+RULES:
+- Plain text or CSV only. NEVER use markdown: no **, no ## headings, no bullet points, no code blocks, no backticks
+- Do NOT explain, justify, or describe your reasoning
+- Do NOT add headers, labels, or introductions
+- Do NOT add extra text beyond what was asked
+- Be short and precise — output the values only, nothing else`;
 
-Respond with ONLY the CSV-formatted data values. Nothing else.`;
+const DEFAULT_JUDGE_PROMPT = `Synthesize worker responses into one best answer.
 
-const DEFAULT_JUDGE_PROMPT = `You are a judge synthesizing worker responses into a single best answer.
-
-CRITICAL: Your best_answer MUST be in strict CSV/tabular format:
-- Comma-separated values ONLY
-- NO explanations, NO prose, NO markdown
-- NO headers - just the data values
-
-If workers disagree, choose the most accurate/complete values and format as CSV.`;
+RULES:
+- Plain text or CSV only. NEVER use markdown: no **, no ## headings, no bullet points, no code blocks, no backticks
+- Do NOT add headers or labels
+- Pick the most accurate values and output them directly
+- You may add a brief reason for your choice, but keep it to one short sentence maximum`;
 
 interface WorkerConfig {
   providerId: string;
@@ -103,7 +101,6 @@ function WorkerCard({ label, cfg, setCfg, enabledProviders }: {
 export default function ConsensusCoderPage() {
   const [data, setData] = useState<Row[]>([]);
   const [dataName, setDataName] = useState("");
-  const [selectedCols, setSelectedCols] = useState<string[]>([]);
   const [workerPrompt, setWorkerPrompt] = useState("");
   const [judgePrompt, setJudgePrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -135,26 +132,54 @@ export default function ConsensusCoderPage() {
   const [judge, setJudge] = useState<WorkerConfig>({ providerId: firstId, model: firstModel });
 
   const allColumns = data.length > 0 ? Object.keys(data[0]) : [];
+  const { selectedCols, toggleCol, toggleAll } = useColumnSelection(allColumns, false);
+
+  const buildAutoInstructions = useCallback(() => {
+    const lines: string[] = [];
+    lines.push("Consensus coding: multiple workers analyze each row, a judge picks the best answer.");
+    lines.push("");
+    lines.push("RULES:");
+    lines.push("- All outputs MUST be plain text or CSV. NEVER use markdown formatting: no **, no ## headings, no bullet points, no code blocks, no backticks.");
+    lines.push("- Workers: apply instructions directly, return values only. Do NOT explain or justify.");
+    lines.push("- Judge: pick the best answer and output it directly. May add one short sentence of reasoning if needed.");
+    lines.push("- Keep all outputs short and precise. No extra text beyond what was requested.");
+    lines.push("");
+
+    if (workerPrompt.trim()) {
+      lines.push("WORKER INSTRUCTIONS:");
+      lines.push(workerPrompt.trim());
+      lines.push("");
+    }
+
+    if (judgePrompt.trim()) {
+      lines.push("JUDGE INSTRUCTIONS:");
+      lines.push(judgePrompt.trim());
+      lines.push("");
+    }
+
+    if (selectedCols.length > 0) {
+      lines.push("COLUMNS: " + selectedCols.join(", "));
+      lines.push("");
+    }
+
+    lines.push(AI_INSTRUCTIONS_MARKER);
+    return lines.join("\n");
+  }, [workerPrompt, judgePrompt, selectedCols]);
+
+  const [aiInstructions, setAiInstructions] = useAIInstructions(buildAutoInstructions);
 
   const handleDataLoaded = (newData: Row[], name: string) => {
     setData(newData);
     setDataName(name);
-    setSelectedCols(Object.keys(newData[0] || {}));
     setResults([]);
     setKappaStats(null);
     toast.success(`Loaded ${newData.length} rows from ${name}`);
   };
 
-  const loadSample = (key: string) => {
-    const s = SAMPLE_DATASETS[key];
-    if (s) handleDataLoaded(s.data, s.name);
+  const handleLoadSample = (key: string) => {
+    const ds = SAMPLE_DATASETS[key];
+    if (ds) handleDataLoaded(ds.data as Row[], ds.name);
   };
-
-  const toggleCol = (col: string) =>
-    setSelectedCols((prev) => prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]);
-
-  const toggleAllCols = () =>
-    setSelectedCols(selectedCols.length === allColumns.length ? [] : [...allColumns]);
 
   const startProcessing = async (mode: RunMode) => {
     if (data.length === 0) return toast.error("No data loaded");
@@ -190,24 +215,15 @@ export default function ConsensusCoderPage() {
     setResults([]);
     setKappaStats(null);
 
-    let localRunId: string | null = null;
-    try {
-      if (isTauri) {
-        const rd = await createRun({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: systemSettings.temperature, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length });
-        localRunId = rd.id;
-      } else {
-        const runRes = await fetch("/api/runs", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runType: "consensus-coder", provider: judge.providerId, model: judge.model, temperature: systemSettings.temperature, systemPrompt: judgePrompt, inputFile: dataName || "unnamed", inputRows: targetData.length }),
-        });
-        if (!runRes.ok) throw new Error(`Server error ${runRes.status}`);
-        const rd = await runRes.json();
-        localRunId = rd.id ?? null;
-      }
-    } catch (err) {
-      console.warn("Run creation failed:", err);
-    }
+    const localRunId = await dispatchCreateRun({
+      runType: "consensus-coder",
+      provider: judge.providerId,
+      model: judge.model,
+      temperature: systemSettings.temperature,
+      systemPrompt: aiInstructions,
+      inputFile: dataName || "unnamed",
+      inputRows: targetData.length,
+    });
 
     const limit = pLimit(systemSettings.maxConcurrency);
     const newResults: Row[] = [...targetData];
@@ -227,38 +243,17 @@ export default function ConsensusCoderPage() {
           const subset: Row = {};
           selectedCols.forEach((col) => (subset[col] = row[col]));
 
-          let result: Awaited<ReturnType<typeof consensusRowDirect>>;
-          if (isTauri) {
-            result = await consensusRowDirect({
-              workers: workers.map((w) => ({ provider: w.provider, model: w.model, apiKey: w.apiKey || "", baseUrl: w.baseUrl })),
-              judge: { provider: judge.providerId, model: judge.model, apiKey: pJ.apiKey || "", baseUrl: pJ.baseUrl },
-              workerPrompt,
-              judgePrompt,
-              userContent: JSON.stringify(subset),
-              enableQualityScoring,
-              enableDisagreementAnalysis,
-            });
-          } else {
-            const res = await fetch("/api/consensus-row", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                workers,
-                judge: { provider: judge.providerId, model: judge.model, apiKey: pJ.apiKey || "local", baseUrl: pJ.baseUrl },
-                workerPrompt,
-                judgePrompt,
-                userContent: JSON.stringify(subset),
-                rowIdx: idx,
-                includeReasoning: includeJudgeReasoning,
-                enableQualityScoring,
-                enableDisagreementAnalysis,
-              }),
-            });
-            if (!res.ok) throw new Error(`Server error ${res.status}`);
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            result = data;
-          }
+          const result = await dispatchConsensusRow({
+            workers: workers.map((w) => ({ provider: w.provider, model: w.model, apiKey: w.apiKey || "", baseUrl: w.baseUrl })),
+            judge: { provider: judge.providerId, model: judge.model, apiKey: pJ.apiKey || "", baseUrl: pJ.baseUrl },
+            workerPrompt: workerPrompt.trim() || DEFAULT_WORKER_PROMPT,
+            judgePrompt: judgePrompt.trim() || DEFAULT_JUDGE_PROMPT,
+            userContent: JSON.stringify(subset),
+            enableQualityScoring,
+            enableDisagreementAnalysis,
+            includeReasoning: includeJudgeReasoning,
+            rowIdx: idx,
+          });
 
           if (result.kappa !== null && result.kappa !== undefined) {
             runningKappa = result.kappa;
@@ -308,27 +303,14 @@ export default function ConsensusCoderPage() {
 
     // Save results to history
     if (localRunId) {
-      try {
-        const resultRows = newResults.map((r, i) => ({
-          rowIndex: i,
-          input: r as Record<string, unknown>,
-          output: (r.judge_best_answer ?? "") as string,
-          status: (r.consensus === "Error" ? "error" : "success") as string,
-          errorMessage: r.error_msg as string | undefined,
-        }));
-        if (isTauri) {
-          await saveResults(localRunId, resultRows);
-        } else {
-          const saveRes = await fetch("/api/results", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ runId: localRunId, results: resultRows }),
-          });
-          if (!saveRes.ok) throw new Error(`Server error ${saveRes.status}`);
-        }
-      } catch (err) {
-        console.warn("Failed to save results to history:", err);
-      }
+      const resultRows = newResults.map((r, i) => ({
+        rowIndex: i,
+        input: r as Record<string, unknown>,
+        output: (r.judge_best_answer ?? "") as string,
+        status: (r.consensus === "Error" ? "error" : "success") as string,
+        errorMessage: r.error_msg as string | undefined,
+      }));
+      await dispatchSaveResults(localRunId, resultRows);
     }
 
     setRunId(localRunId);
@@ -343,18 +325,13 @@ export default function ConsensusCoderPage() {
     );
   };
 
-  const handleExport = () => {
-    if (results.length === 0) return;
-    void downloadCSV(results as Record<string, unknown>[], `consensus_results_${dataName || Date.now()}.csv`);
-  };
-
   const progressPct = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-0 pb-16">
+    <div className="space-y-0 pb-16">
 
       {/* Header */}
-      <div className="pb-6 space-y-1">
+      <div className="pb-6 space-y-1 max-w-3xl">
         <h1 className="text-4xl font-bold">Consensus Coder</h1>
         <p className="text-muted-foreground text-sm">Multi-model consensus coding with inter-rater reliability (Cohen&apos;s Kappa)</p>
       </div>
@@ -362,58 +339,43 @@ export default function ConsensusCoderPage() {
       {/* ── 1. Upload Data ────────────────────────────────────────────────── */}
       <div className="space-y-4 pb-8">
         <h2 className="text-2xl font-bold">1. Upload Data</h2>
-        <FileUploader onDataLoaded={handleDataLoaded} />
-        <SampleDatasetPicker onSelect={loadSample} />
-
-        {data.length > 0 && (
-          <>
-            <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-green-50 dark:bg-green-950/20 border border-green-200 text-sm text-green-700 dark:text-green-300">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              <span><strong>{data.length} rows</strong> loaded from <strong>{dataName}</strong></span>
-            </div>
-            <div className="border rounded-lg overflow-hidden">
-              <div className="px-4 py-2.5 border-b bg-muted/20 text-sm font-medium flex justify-between items-center">
-                <span>Data Preview</span>
-                <span className="text-xs text-muted-foreground font-normal">first 5 of {data.length} rows</span>
-              </div>
-              <DataTable data={data} maxRows={5} />
-            </div>
-          </>
-        )}
+        <UploadPreview
+          data={data}
+          dataName={dataName}
+          onDataLoaded={handleDataLoaded}
+          maxPreviewRows={5}
+          samplePickerPosition="above"
+          customSamplePicker={
+            <Select onValueChange={handleLoadSample}>
+              <SelectTrigger className="w-[200px] h-9 text-xs">
+                <SelectValue placeholder="-- Select a sample..." />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.keys(SAMPLE_DATASETS).map((key) => (
+                  <SelectItem key={key} value={key} className="text-xs">
+                    {SAMPLE_DATASETS[key].name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+        />
       </div>
 
       <div className="border-t" />
 
       {/* ── 2. Select Columns ─────────────────────────────────────────────── */}
       <div className="space-y-4 py-8">
-        <h2 className="text-2xl font-bold">2. Select Columns</h2>
-        <p className="text-sm text-muted-foreground">Choose which columns to send to each worker model for coding.</p>
-
-        {data.length === 0 ? (
-          <p className="text-sm text-muted-foreground italic">Upload data first to see available columns.</p>
-        ) : (
-          <>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-4 border rounded-lg bg-muted/5">
-              {allColumns.map((col) => (
-                <label key={col} className="flex items-center gap-2 cursor-pointer group">
-                  <input
-                    type="checkbox"
-                    checked={selectedCols.includes(col)}
-                    onChange={() => toggleCol(col)}
-                    className="accent-purple-500 w-4 h-4"
-                  />
-                  <span className="text-sm truncate group-hover:text-foreground transition-colors">{col}</span>
-                </label>
-              ))}
-            </div>
-            <div className="flex items-center gap-3 text-xs text-muted-foreground">
-              <button onClick={toggleAllCols} className="underline hover:text-foreground transition-colors">
-                {selectedCols.length === allColumns.length ? "Deselect all" : "Select all"}
-              </button>
-              <span>{selectedCols.length} of {allColumns.length} columns selected</span>
-            </div>
-          </>
-        )}
+        <h2 className="text-2xl font-bold">2. Define Columns</h2>
+        <ColumnSelector
+          allColumns={allColumns}
+          selectedCols={selectedCols}
+          onToggleCol={toggleCol}
+          onToggleAll={toggleAll}
+          accentColor="accent-purple-500"
+          description="Choose which columns to send to each worker model for coding."
+          emptyMessage="Upload data first to see available columns."
+        />
       </div>
 
       <div className="border-t" />
@@ -489,27 +451,7 @@ export default function ConsensusCoderPage() {
 
       {/* ── 4. Prompts ────────────────────────────────────────────────────── */}
       <div className="space-y-5 py-8">
-        <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-bold">4. Prompts</h2>
-          <Select onValueChange={(v) => {
-            if (v === "default") {
-              setWorkerPrompt(DEFAULT_WORKER_PROMPT);
-              setJudgePrompt(DEFAULT_JUDGE_PROMPT);
-            } else if (v === "rigorous") {
-              setWorkerPrompt("Analyze the provided data with extreme rigor. Double-check your reasoning.\n\nCRITICAL FORMAT REQUIREMENTS:\n- Output MUST be in strict CSV format\n- NO explanations, NO prose, NO markdown, NO code blocks\n- NO headers or labels - just the raw values\n\nRespond with ONLY the CSV-formatted data values. Nothing else.");
-              setJudgePrompt("You are a meticulous judge. Scrutinize each worker response for accuracy and completeness.\n\nCRITICAL: Your best_answer MUST be in strict CSV/tabular format:\n- Comma-separated values ONLY\n- NO explanations, NO prose, NO markdown\n\nIf workers disagree, provide detailed reasoning for your choice.");
-            }
-            toast.success("Prompts loaded");
-          }}>
-            <SelectTrigger className="h-8 text-xs w-[180px]">
-              <SelectValue placeholder="Sample prompts…" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="default" className="text-xs">Default (standard)</SelectItem>
-              <SelectItem value="rigorous" className="text-xs">Rigorous (detailed)</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+        <h2 className="text-2xl font-bold">4. Define Instructions</h2>
 
         <div className="grid grid-cols-2 gap-6">
           <div className="space-y-2">
@@ -550,9 +492,18 @@ export default function ConsensusCoderPage() {
 
       <div className="border-t" />
 
-      {/* ── 5. Execute ────────────────────────────────────────────────────── */}
+      {/* ── 5. AI Instructions ─────────────────────────────────────────────── */}
+      <AIInstructionsSection
+        sectionNumber={5}
+        value={aiInstructions}
+        onChange={setAiInstructions}
+      />
+
+      <div className="border-t" />
+
+      {/* ── 6. Execute ────────────────────────────────────────────────────── */}
       <div className="space-y-4 py-8">
-        <h2 className="text-2xl font-bold">5. Execute</h2>
+        <h2 className="text-2xl font-bold">6. Execute</h2>
 
         {isProcessing && (
           <div className="space-y-2">
@@ -617,9 +568,6 @@ export default function ConsensusCoderPage() {
                   View in History
                 </Link>
               )}
-              <Button variant="outline" size="sm" onClick={handleExport}>
-                <Download className="h-4 w-4 mr-2" /> Export CSV
-              </Button>
             </div>
           </div>
 
@@ -647,7 +595,7 @@ export default function ConsensusCoderPage() {
           )}
 
           <div className="border rounded-lg overflow-hidden">
-            <DataTable data={results} />
+            <DataTable data={results} showAll />
           </div>
         </div>
       )}

@@ -16,9 +16,12 @@ import {
   ChevronLeft,
   ChevronRight,
   Trash2,
+  Users,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -33,6 +36,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+
+interface Stats {
+  totalSessions: number;
+  totalRuns: number;
+  totalSuccess: number;
+  totalError: number;
+}
 
 const PAGE_SIZE = 20;
 
@@ -56,6 +66,7 @@ function HistoryContent() {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [providerFilter, setProviderFilter] = useState("all");
+  const [stats, setStats] = useState<Stats>({ totalSessions: 0, totalRuns: 0, totalSuccess: 0, totalError: 0 });
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -71,8 +82,10 @@ function HistoryContent() {
         const data = await listRuns(PAGE_SIZE, offset);
         setRuns(data.runs as RunMeta[]);
         setTotal(data.total ?? 0);
+        if (data.stats) setStats(data.stats);
       } else {
         const res = await fetch(`/api/runs?limit=${PAGE_SIZE}&offset=${offset}`);
+        if (!res.ok) throw new Error(`Failed to fetch runs: ${res.status}`);
         const data = await res.json();
         if (Array.isArray(data)) {
           setRuns(data as RunMeta[]);
@@ -80,6 +93,7 @@ function HistoryContent() {
         } else {
           setRuns(data.runs as RunMeta[]);
           setTotal(data.total ?? 0);
+          if (data.stats) setStats(data.stats);
         }
       }
       setPage(pageNum);
@@ -146,11 +160,11 @@ function HistoryContent() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto space-y-0 pb-16">
+    <div className="space-y-0 pb-16">
 
       {/* Header */}
       <div className="pb-6 flex items-start justify-between">
-        <div className="space-y-1">
+        <div className="space-y-1 max-w-3xl">
           <h1 className="text-4xl font-bold">History</h1>
           <p className="text-muted-foreground text-sm">Review past processing sessions and results</p>
         </div>
@@ -168,6 +182,54 @@ function HistoryContent() {
           )}
           Refresh
         </Button>
+      </div>
+
+      {/* Stats Dashboard */}
+      <div className="pb-6 grid grid-cols-3 gap-4">
+        <Card className="py-4">
+          <CardContent className="flex items-center gap-3 px-4">
+            <div className="h-9 w-9 rounded-lg bg-indigo-50 dark:bg-indigo-950/30 flex items-center justify-center shrink-0">
+              <Users className="h-4 w-4 text-indigo-600" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold leading-none">{stats.totalSessions}</p>
+              <p className="text-xs text-muted-foreground mt-1">Sessions</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="py-4">
+          <CardContent className="flex items-center gap-3 px-4">
+            <div className="h-9 w-9 rounded-lg bg-violet-50 dark:bg-violet-950/30 flex items-center justify-center shrink-0">
+              <BarChart2 className="h-4 w-4 text-violet-600" />
+            </div>
+            <div>
+              <p className="text-2xl font-bold leading-none">{stats.totalRuns}</p>
+              <p className="text-xs text-muted-foreground mt-1">Total Runs</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="py-4">
+          <CardContent className="px-4 space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">Success Rate</p>
+              <p className="text-sm font-bold">
+                {stats.totalSuccess + stats.totalError > 0
+                  ? `${Math.round((stats.totalSuccess / (stats.totalSuccess + stats.totalError)) * 100)}%`
+                  : "N/A"}
+              </p>
+            </div>
+            <Progress
+              value={
+                stats.totalSuccess + stats.totalError > 0
+                  ? (stats.totalSuccess / (stats.totalSuccess + stats.totalError)) * 100
+                  : 0
+              }
+            />
+            <p className="text-[10px] text-muted-foreground">
+              {stats.totalSuccess} succeeded, {stats.totalError} failed
+            </p>
+          </CardContent>
+        </Card>
       </div>
 
       {/* Search + Filters */}

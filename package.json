@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --webpack",
     "build": "next build",
     "build:tauri": "bash -c 'set -e; trap \"[ -d /tmp/handai_api_backup ] && mv /tmp/handai_api_backup src/app/api || true; [ -f /tmp/handai_histid_page.tsx ] && mv /tmp/handai_histid_page.tsx src/app/history/[id]/page.tsx || true\" EXIT; mv src/app/api /tmp/handai_api_backup && mv src/app/history/\\[id\\]/page.tsx /tmp/handai_histid_page.tsx && TAURI_BUILD=1 next build'",
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.46",

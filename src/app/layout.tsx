@@ -30,7 +30,7 @@ export default function RootLayout({
                   <SidebarTrigger />
                   <div className="ml-4 font-semibold">Handai AI Data Suite</div>
                 </div>
-                <div className="p-6">
+                <div className="px-8 py-6">
                   {children}
                 </div>
               </main>

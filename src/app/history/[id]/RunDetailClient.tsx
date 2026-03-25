@@ -132,7 +132,7 @@ export default function RunDetailClient({ id }: { id: string }) {
     };
 
     return (
-        <div className="max-w-7xl mx-auto space-y-6 pb-20">
+        <div className="space-y-6 pb-20">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
                     <Button asChild variant="ghost" size="icon">
@@ -223,7 +223,7 @@ export default function RunDetailClient({ id }: { id: string }) {
                         <Badge variant="secondary" className="text-[10px]">{results.length} Rows</Badge>
                     </CardHeader>
                     <CardContent className="p-0">
-                        <DataTable data={results} />
+                        <DataTable data={results} showAll />
                     </CardContent>
                 </Card>
             </div>

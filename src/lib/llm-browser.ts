@@ -38,32 +38,97 @@ export interface ConsensusResult {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function parseCsv(text: string): Record<string, string>[] {
+function parseRow(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (ch === "," && !inQuotes) {
+      values.push(current.trim()); current = "";
+    } else {
+      current += ch;
+    }
+  }
+  values.push(current.trim());
+  return values;
+}
+
+function parseCsv(text: string, expectedColumns?: string[]): Record<string, string>[] {
   const lines = text
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
   if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
+
+  const aiHeaders = parseRow(lines[0]);
+
+  if (expectedColumns && expectedColumns.length > 0) {
+    const aiLower = aiHeaders.map((h) => h.toLowerCase());
+    const colIndex = new Map<string, number>();
+    for (const col of expectedColumns) {
+      const idx = aiLower.indexOf(col.toLowerCase());
+      if (idx !== -1) colIndex.set(col, idx);
+    }
+
+    return lines.slice(1).map((line) => {
+      const values = parseRow(line);
+      const row: Record<string, string> = {};
+      for (const col of expectedColumns) {
+        const idx = colIndex.get(col);
+        row[col] = idx !== undefined ? (values[idx] ?? "") : "";
+      }
+      return row;
+    });
+  }
+
   return lines.slice(1).map((line) => {
-    const values: string[] = [];
-    let current = "";
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-        else { inQuotes = !inQuotes; }
-      } else if (ch === "," && !inQuotes) {
-        values.push(current); current = "";
-      } else {
-        current += ch;
+    const values = parseRow(line);
+    const row: Record<string, string> = {};
+    aiHeaders.forEach((h, idx) => { row[h] = values[idx] ?? ""; });
+    return row;
+  });
+}
+
+function parseJsonLines(text: string, expectedColumns?: string[]): Record<string, string>[] {
+  let objects: Record<string, unknown>[];
+
+  const cleaned = text.replace(/^```(?:json(?:l)?)?\s*/im, "").replace(/\s*```\s*$/m, "").trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    objects = Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    objects = cleaned
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("{"))
+      .map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      })
+      .filter((o): o is Record<string, unknown> => o !== null);
+  }
+
+  if (objects.length === 0) return [];
+
+  return objects.map((obj) => {
+    const row: Record<string, string> = {};
+    if (expectedColumns && expectedColumns.length > 0) {
+      const keyMap = new Map<string, string>();
+      for (const k of Object.keys(obj)) keyMap.set(k.toLowerCase(), k);
+      for (const col of expectedColumns) {
+        const actualKey = keyMap.get(col.toLowerCase());
+        row[col] = actualKey !== undefined ? String(obj[actualKey] ?? "") : "";
+      }
+    } else {
+      for (const [k, v] of Object.entries(obj)) {
+        row[k] = String(v ?? "");
       }
     }
-    values.push(current);
-    const row: Record<string, string> = {};
-    headers.forEach((h, idx) => { row[h] = values[idx]?.trim() ?? ""; });
     return row;
   });
 }
@@ -116,19 +181,31 @@ export async function generateRowDirect(params: {
   columns?: Array<{ name: string; type: string; description?: string }>;
   freeformPrompt?: string;
   temperature?: number;
+  systemPrompt?: string;
 }): Promise<{ rows: Record<string, string>[]; rawCsv: string; count: number }> {
   const aiModel = getModel(params.provider, params.model, params.apiKey, params.baseUrl);
 
   let systemPrompt: string;
   let userPrompt: string;
 
-  if (params.columns && params.columns.length > 0) {
+  if (params.systemPrompt) {
+    systemPrompt = params.systemPrompt;
+    if (params.columns && params.columns.length > 0) {
+      const colDefs = params.columns
+        .map((c) => `${c.name} (${c.type}${c.description ? `: ${c.description}` : ""})`)
+        .join(", ");
+      const colNames = params.columns.map((c) => c.name).join('", "');
+      userPrompt = `Generate ${params.rowCount} rows of realistic data as a JSON array.\nColumns: ${colDefs}\nJSON keys must be: ["${colNames}"]`;
+    } else {
+      userPrompt = `${params.freeformPrompt ?? "Generate a realistic dataset"}\nGenerate exactly ${params.rowCount} rows as a JSON array.`;
+    }
+  } else if (params.columns && params.columns.length > 0) {
     systemPrompt = getPrompt("generate.csv_with_cols");
     const colDefs = params.columns
       .map((c) => `${c.name} (${c.type}${c.description ? `: ${c.description}` : ""})`)
       .join(", ");
-    const headerLine = params.columns.map((c) => c.name).join(",");
-    userPrompt = `Generate ${params.rowCount} rows of realistic data.\nColumns: ${colDefs}\nCSV Header must be: ${headerLine}`;
+    const colNames = params.columns.map((c) => c.name).join('", "');
+    userPrompt = `Generate ${params.rowCount} rows of realistic data.\nColumns: ${colDefs}\nJSON keys must be: ["${colNames}"]`;
   } else {
     systemPrompt = getPrompt("generate.csv_freeform");
     userPrompt = `${params.freeformPrompt ?? "Generate a realistic dataset"}\nGenerate exactly ${params.rowCount} rows.`;
@@ -146,8 +223,13 @@ export async function generateRowDirect(params: {
     { maxAttempts: 3, baseDelayMs: 200 }
   );
 
-  const cleaned = text.replace(/^```(?:csv)?\s*/im, "").replace(/\s*```\s*$/m, "").trim();
-  const rows = parseCsv(cleaned);
+  const cleaned = text.replace(/^```(?:json(?:l)?|csv)?\s*/im, "").replace(/\s*```\s*$/m, "").trim();
+  const expectedCols = params.columns?.map((c) => c.name);
+  let rows = parseJsonLines(cleaned, expectedCols);
+  if (rows.length === 0) {
+    // Fallback to CSV parsing if LLM ignored JSON instruction
+    rows = parseCsv(cleaned, expectedCols);
+  }
   return { rows, rawCsv: cleaned, count: rows.length };
 }
 
@@ -481,6 +563,7 @@ export async function documentAnalyzeDirect(params: {
   model: string;
   apiKey: string;
   baseUrl?: string;
+  hint?: string;
 }): Promise<{ fields: FieldDef[] }> {
   const { extractTextBrowser } = await import("./document-browser");
   const { text: rawText } = await extractTextBrowser(params.file);
@@ -490,12 +573,16 @@ export async function documentAnalyzeDirect(params: {
 
   const aiModel = getModel(params.provider, params.model, params.apiKey, params.baseUrl);
 
+  const promptParts = [`Document: ${params.file.name}`];
+  if (params.hint) promptParts.push(`\nExtraction goal: ${params.hint}`);
+  promptParts.push(`\n\n${sampleText}`);
+
   const { text } = await withRetry(
     () =>
       generateText({
         model: aiModel,
         system: getPrompt("document.analysis"),
-        prompt: `Document: ${params.file.name}\n\n${sampleText}`,
+        prompt: promptParts.join(""),
         temperature: 0,
         maxOutputTokens: 1024,
       }),

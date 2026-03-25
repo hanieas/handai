@@ -165,3 +165,14 @@ export interface SystemSettings {
   autoRetry: boolean;
   autoSavePath: string;
 }
+
+/** Standardized result entry for run history persistence. */
+export interface ResultEntry {
+  rowIndex: number;
+  input: Record<string, unknown>;
+  output: string | Record<string, unknown>;
+  status?: string;
+  latency?: number;
+  errorType?: string;
+  errorMessage?: string;
+}
