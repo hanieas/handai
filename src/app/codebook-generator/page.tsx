@@ -16,7 +16,7 @@ import { getPrompt } from "@/lib/prompts";
 import { SAMPLE_DATASETS } from "@/lib/sample-data";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Download, Loader2, CheckCircle2, ChevronDown, X } from "lucide-react";
-import XLSX from "xlsx";
+import * as XLSX from "xlsx";
 import { toast } from "sonner";
 import type { Row } from "@/types";
 import { dispatchProcessRow, dispatchCreateRun, dispatchSaveResults } from "@/lib/llm-dispatch";

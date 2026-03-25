@@ -37,7 +37,7 @@ jobs:
           # Move API routes and dynamic history page out (not compatible with static export)
           mv src/app/api /tmp/handai_api_backup
           mv "src/app/history/[id]/page.tsx" /tmp/handai_histid_page.tsx
-          npx next build
+          npx next build --webpack
           # Restore
           mv /tmp/handai_api_backup src/app/api
           mv /tmp/handai_histid_page.tsx "src/app/history/[id]/page.tsx"
