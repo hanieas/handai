@@ -42,6 +42,9 @@ jobs:
           mv /tmp/handai_api_backup src/app/api
           mv /tmp/handai_histid_page.tsx "src/app/history/[id]/page.tsx"
 
+      - name: Add .nojekyll
+        run: touch out/.nojekyll
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: out

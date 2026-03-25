@@ -227,9 +227,12 @@ function useLocalProviderDetection() {
     const { providers, setProviderConfig } = useAppStore();
 
     React.useEffect(() => {
-        const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+        const _isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+        const _isStatic = process.env.NEXT_PUBLIC_STATIC === "1";
 
-        const fetchDetected = isTauri
+        // In Tauri or static web builds there is no /api/local-models server endpoint.
+        // Probe localhost directly (CORS may block this in browsers, but we catch errors).
+        const fetchDetected = (_isTauri || _isStatic)
             ? Promise.all([
                   fetch("http://localhost:11434/api/tags").then((r) => r.json()).catch(() => null),
                   fetch("http://localhost:1234/v1/models").then((r) => r.json()).catch(() => null),

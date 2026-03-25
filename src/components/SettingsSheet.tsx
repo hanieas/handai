@@ -58,6 +58,7 @@ const PROMPT_CATEGORY_LABELS: Record<string, string> = {
 };
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const isStatic = process.env.NEXT_PUBLIC_STATIC === "1";
 
 export function SettingsSheet({ open, onOpenChange }: SettingsSheetProps) {
   const { providers, setProviderConfig } = useAppStore();
@@ -82,9 +83,21 @@ export function SettingsSheet({ open, onOpenChange }: SettingsSheetProps) {
   const detectLocalModels = async () => {
     setIsDetecting(true);
     try {
-      const res = await fetch("/api/local-models");
-      const data = await res.json();
-      setLocalModels(data);
+      if (isTauri || isStatic) {
+        // No server endpoint — probe localhost directly (CORS may block in browsers)
+        const [ollama, lm] = await Promise.all([
+          fetch("http://localhost:11434/api/tags").then((r) => r.json()).catch(() => null),
+          fetch("http://localhost:1234/v1/models").then((r) => r.json()).catch(() => null),
+        ]);
+        const result: Record<string, string[]> = {};
+        if (ollama?.models) result.ollama = (ollama.models as { name: string }[]).map((m) => m.name);
+        if (lm?.data) result.lmstudio = (lm.data as { id: string }[]).map((m) => m.id);
+        setLocalModels(result);
+      } else {
+        const res = await fetch("/api/local-models");
+        const data = await res.json();
+        setLocalModels(data);
+      }
     } catch {}
     finally { setIsDetecting(false); }
   };
@@ -105,19 +118,25 @@ export function SettingsSheet({ open, onOpenChange }: SettingsSheetProps) {
     if (!config.isLocal && !config.apiKey) return toast.error("Enter an API key first");
     setIsTesting(id);
     try {
-      const res = await fetch("/api/process-row", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: id, model: config.defaultModel,
-          apiKey: config.apiKey || "local", baseUrl: config.baseUrl,
-          systemPrompt: "You are a helpful assistant.",
-          userContent: "Reply with the single word: OK",
-          temperature: 0,
-        }),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const params = {
+        provider: id, model: config.defaultModel,
+        apiKey: config.apiKey || "local", baseUrl: config.baseUrl,
+        systemPrompt: "You are a helpful assistant.",
+        userContent: "Reply with the single word: OK",
+        temperature: 0,
+      };
+      if (isTauri || isStatic) {
+        const { processRowDirect } = await import("@/lib/llm-browser");
+        await processRowDirect(params);
+      } else {
+        const res = await fetch("/api/process-row", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+      }
       toast.success(`${PROVIDER_LABELS[id] ?? id} — connected`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
